@@ -62,8 +62,12 @@ CFG = {
     "honeypot": {
         "ip": "10.10.10.50",   # Cowrie — never target directly
     },
+    "ids": {
+        "ip": "10.20.20.5",    # RPi5 IDS (Zeek/Suricata) — skip in OT sweep
+    },
     "plc": {
         "ip":           "10.20.20.100",
+        "type":         "Allen-Bradley / Rockwell (EtherNet/IP)",
         "tag":          "Dosage_Rate",
         "safe_value":   8,
         "attack_value": 32,
@@ -748,74 +752,117 @@ def phase4_ssh_pivot() -> PhaseResult:
             err(f"No route to {plc_ip} — OT zone may not be reachable from Historian")
         findings.append(f"Route:\n{route_out}")
 
-        # ── 3. Ping PLC — parse ICMP replies, not just exit code ────────────
-        console.print("\n[bold cyan]Ping PLC[/bold cyan]")
-        ping_out, _, ping_rc = ssh_run(client, f"ping -c 4 -W 2 {plc_ip}")
-        icmp_replies = [l for l in ping_out.splitlines() if "bytes from" in l]
+        # ── 3. OT Fingerprinting Sweep ──────────────────────────────────────
+        # Probe industrial ports across the full OT subnet from the Historian.
+        # No assumptions about vendor — let the open ports tell us what's there.
+        PORT_VENDOR = {
+            "44818": "Allen-Bradley / Rockwell (EtherNet/IP)",
+            "102":   "Siemens S7 (ISO-TSAP)",
+            "502":   "Modbus TCP Device",
+        }
+        SKIP_IPS = {CFG["ids"]["ip"], "10.20.20.254"}  # IDS + gateway
 
-        if icmp_replies:
-            checks["ping"] = True
-            ok(f"PLC {plc_ip} is alive — {len(icmp_replies)} ICMP replies received")
-            for rep in icmp_replies:
-                console.print(f"  [green]{escape(rep.strip())}[/green]")
+        console.print("\n[bold cyan]OT Fingerprinting Sweep (nc multi-port)[/bold cyan]")
+        info("Probing ports 44818 (AB), 102 (Siemens), 502 (Modbus) across 10.20.20.1–254...")
+
+        sweep_cmd = (
+            "for i in {1..254}; do "
+            "(for p in 102 502 44818; do "
+            "nc -z -w 1 10.20.20.$i $p 2>/dev/null "
+            "&& echo \"10.20.20.$i:$p\"; "
+            "done) & "
+            "done; wait"
+        )
+        sweep_out, _, _ = ssh_run(client, sweep_cmd, timeout=60)
+
+        # Parse "IP:PORT" lines, filter out IDS and gateway
+        discovered_devices: list[dict] = []
+        for line in sweep_out.splitlines():
+            line = line.strip()
+            if ":" not in line:
+                continue
+            parts = line.split(":")
+            if len(parts) != 2:
+                continue
+            d_ip, d_port = parts[0].strip(), parts[1].strip()
+            if not d_ip.startswith("10.20.20."):
+                continue
+            if d_ip in SKIP_IPS:
+                continue
+            vendor = PORT_VENDOR.get(d_port, f"Unknown (port {d_port})")
+            discovered_devices.append({"ip": d_ip, "port": d_port, "vendor": vendor})
+
+        # ── Display results table ────────────────────────────────────────────
+        sweep_table = Table(
+            show_header=True, header_style="bold magenta", border_style="dim"
+        )
+        sweep_table.add_column("Discovered IP",   style="cyan",  width=18)
+        sweep_table.add_column("Open Port",        style="white", width=12)
+        sweep_table.add_column("Inferred PLC Type", style="green", width=40)
+
+        for dev in discovered_devices:
+            sweep_table.add_row(dev["ip"], dev["port"], dev["vendor"])
+
+        if discovered_devices:
+            console.print(sweep_table)
         else:
-            err(f"PLC {plc_ip} did NOT respond to ping — running OT sweep to find real IP")
+            console.print(sweep_table)   # show empty table headers for clarity
 
-            # ── 3b. Ping sweep fallback — find real PLC in 10.20.20.0/24 ────
-            console.print("\n[bold yellow]Running OT zone sweep from Historian...[/bold yellow]")
-            sweep_cmd = (
-                "for i in {1..254}; do "
-                "(ping -c 1 -W 1 10.20.20.$i >/dev/null 2>&1 "
-                "&& echo \"10.20.20.$i\") & "
-                "done; wait"
+        # ── Update config with best candidate ───────────────────────────────
+        # Prefer EtherNet/IP (44818) → Modbus (502) → S7 (102)
+        PORT_PRIORITY = ["44818", "502", "102"]
+        best = None
+        for preferred_port in PORT_PRIORITY:
+            best = next(
+                (d for d in discovered_devices if d["port"] == preferred_port), None
             )
-            sweep_out, _, _ = ssh_run(client, sweep_cmd, timeout=60)
+            if best:
+                break
 
-            live_hosts = [
-                line.strip() for line in sweep_out.splitlines()
-                if line.strip().startswith("10.20.20.")
-                and not line.strip().endswith(".254")   # skip gateway
-            ]
+        if best:
+            old_plc_ip = plc_ip
+            CFG["plc"]["ip"]   = best["ip"]
+            CFG["plc"]["type"] = best["vendor"]
+            plc_ip = best["ip"]
+            checks["ping"] = True
 
-            if live_hosts:
-                discovered = live_hosts[0]  # take first live host that isn't the gw
-
+            if best["ip"] != old_plc_ip:
                 console.print(Panel(
-                    f"[bold white]Configured PLC IP:[/bold white]  [red]{plc_ip}[/red]  (no response)\n"
-                    f"[bold white]Discovered PLC IP:[/bold white]  [bold green]{discovered}[/bold green]\n\n"
-                    f"[dim]CFG[\"plc\"][\"ip\"] updated in memory — Phase 5 will target {discovered}[/dim]",
+                    f"[bold white]Configured IP :[/bold white]  "
+                    f"[red]{old_plc_ip}[/red]  (not seen in sweep)\n"
+                    f"[bold white]Discovered IP :[/bold white]  "
+                    f"[bold green]{best['ip']}[/bold green]  port {best['port']}\n"
+                    f"[bold white]Vendor        :[/bold white]  {best['vendor']}\n\n"
+                    f"[dim]CFG updated — Phase 5 will target {best['ip']}[/dim]",
                     title="[bold yellow] PLC IP AUTO-CORRECTED [/bold yellow]",
                     border_style="yellow",
                     expand=False,
                 ))
-
-                CFG["plc"]["ip"] = discovered
-                plc_ip = discovered
-                checks["ping"] = True
-                findings.append(f"Sweep found: {live_hosts}")
             else:
-                err("OT sweep found no live hosts in 10.20.20.0/24")
-                if "100% packet loss" in ping_out:
-                    err("100% packet loss — OT zone may be unreachable from Historian")
-                elif "Network unreachable" in ping_out or "No route" in ping_out:
-                    err("Network unreachable — no route from Historian to OT zone")
+                ok(f"PLC confirmed: {best['ip']}  ({best['vendor']}  port {best['port']})")
+        else:
+            checks["ping"] = False
+            err("No recognised industrial devices found on OT subnet (ports 44818/502/102 all closed)")
 
-        findings.append(f"Ping:\n{ping_out}")
+        findings.append(f"OT Sweep:\n{sweep_out}")
 
         client.close()
 
         # ── Determine overall phase result ───────────────────────────────────
         if checks["route"] and checks["ping"]:
             r.status  = "success"
-            r.finding = f"OT zone confirmed reachable — route + ICMP verified to {plc_ip}"
+            r.finding = (
+                f"OT zone confirmed — {plc_ip} "
+                f"({CFG['plc'].get('type', 'unknown vendor')})"
+            )
             ok(r.finding)
         elif checks["route"] and not checks["ping"]:
             r.status  = "failed"
-            r.finding = f"Route to {plc_ip} exists but no live host found in 10.20.20.0/24"
+            r.finding = "No recognised industrial devices found on the OT subnet"
             err(r.finding)
         elif not checks["route"]:
             r.status  = "failed"
-            r.finding = f"No route from Historian to OT zone ({plc_ip}) — pivot blocked"
+            r.finding = f"No route from Historian to OT zone — pivot blocked"
             err(r.finding)
 
         r.output = "\n".join(findings)
@@ -915,7 +962,7 @@ def phase6_defense_check() -> PhaseResult:
     phase_header(6, "Defense Validation (Secure State)")
     r = PhaseResult("Defense Validation")
 
-    ids_ip       = "10.20.20.5"
+    ids_ip       = CFG["ids"]["ip"]
     ids_username = CFG["historian"]["username"]
     ids_password = CFG["historian"]["password"]
     ids_port     = CFG["historian"]["port"]
