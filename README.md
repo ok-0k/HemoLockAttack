@@ -77,4 +77,4 @@ python3 redteam_chain.py --auto
 
 **Defense:** Suricata, Zeek, Grafana, InfluxDB, rsyslog, Cowrie
 
-**Hardware:** Allen Bradley PLC, Raspberry Pi 5 ×3, FortiGate Rugged 60D, Cisco IE-2000 ×2, Cisco WLC 3500, C9120AXI AP, MasterFlex Peristaltic Pump
+**Hardware:** Allen Bradley PLC, Raspberry Pi 5 ×4, FortiGate Rugged 60D, Cisco IE-2000 ×2, Cisco WLC 3500, C9120AXI AP, MasterFlex Peristaltic Pump
