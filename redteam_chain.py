@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-"""
-INCS 4810 Red Team Attack Chain Automation
-BCIT SW01-3550 — Authorized Academic Lab Exercise
-Instructor: Victor Mendez | Framework: ISA/IEC 62443
-"""
+
 
 import subprocess
 import sys
