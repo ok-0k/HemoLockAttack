@@ -241,6 +241,72 @@ def confirm_phase(title: str) -> bool:
     return Confirm.ask(f"\n[yellow]Run[/yellow] [bold]{title}[/bold]?", default=True)
 
 
+def _find_gateway() -> str | None:
+    """Return the default gateway IP from the routing table."""
+    rc, out = run_cmd("ip route show default", capture=False)
+    for line in out.splitlines():
+        parts = line.split()
+        if "default" in parts and "via" in parts:
+            return parts[parts.index("via") + 1]
+    return None
+
+
+def _inject_route(subnet: str, via: str):
+    """Add a host route silently; ignore error if it already exists."""
+    run_cmd(f"sudo ip route add {subnet} via {via} 2>/dev/null || true", capture=False)
+
+
+def _probe_gateway_for_subnets(gateway: str) -> list[str]:
+    """
+    Send a quick nmap ping sweep through the gateway to discover
+    which subnets are reachable, then infer /24 networks from live hosts.
+    Works by doing a broad sweep of RFC-1918 space that the gateway routes.
+    """
+    info(f"Probing gateway {gateway} for reachable subnets...")
+    # Sweep private ranges quickly — hosts that reply must be routable via gw
+    sweep_targets = "10.0.0.0/8 172.16.0.0/12 192.168.0.0/16"
+    rc, out = run_cmd(
+        f"nmap -T4 -n --open -sn --send-eth "
+        f"--script='' {sweep_targets} 2>/dev/null | grep 'Nmap scan report'",
+        timeout=20, capture=False
+    )
+    found: set[str] = set()
+    for line in out.splitlines():
+        # "Nmap scan report for 10.10.10.20" → extract /24
+        parts = line.strip().split()
+        if parts:
+            ip = parts[-1].strip("()")
+            segments = ip.split(".")
+            if len(segments) == 4:
+                net = ".".join(segments[:3]) + ".0/24"
+                found.add(net)
+    return list(found)
+
+
+def auto_route(subnets: list[str]):
+    """
+    Automatically inject routes to target subnets via the default gateway.
+    Called before nmap so the scan can reach IDMZ and OT zones.
+    """
+    gw = _find_gateway()
+    if not gw:
+        warn("Could not determine default gateway — routes may be missing")
+        return
+
+    info(f"Default gateway: {gw}")
+
+    target_subnets = subnets + _probe_gateway_for_subnets(gw)
+    injected = []
+    for subnet in set(target_subnets):
+        rc, _ = run_cmd(f"ip route get {subnet.split('/')[0]}", capture=False)
+        # Only inject if not already reachable
+        _inject_route(subnet, gw)
+        injected.append(subnet)
+
+    if injected:
+        ok(f"Routes injected via {gw}: {', '.join(set(injected))}")
+
+
 def preflight_check():
     """Verify required system tools are installed before running any phase."""
     tools = ["nmap", "aircrack-ng", "airodump-ng", "aireplay-ng", "airmon-ng"]
@@ -254,6 +320,12 @@ def preflight_check():
         err("Install with: sudo apt-get install -y nmap aircrack-ng")
         sys.exit(1)
     ok(f"Preflight OK — all tools found: {', '.join(tools)}")
+
+    # Auto-inject routes to known target subnets so scans reach IDMZ/OT
+    auto_route([
+        CFG["nmap"]["idmz_subnet"],
+        "10.20.20.0/24",
+    ])
 
 
 # ── Phase implementations ─────────────────────────────────────────────────────
