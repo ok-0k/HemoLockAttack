@@ -310,77 +310,104 @@ def _probe_gateway_for_subnets(gateway: str) -> list[str]:
     return list(found)
 
 
-def _accept_icmp_redirects():
-    """Allow the kernel to follow ICMP redirects and update its routing table."""
-    run_cmd("sudo sysctl -w net.ipv4.conf.all.accept_redirects=1 >/dev/null 2>&1", capture=False)
-    run_cmd("sudo sysctl -w net.ipv4.conf.all.secure_redirects=1 >/dev/null 2>&1", capture=False)
-    run_cmd("sudo sysctl -w net.ipv4.conf.default.accept_redirects=1 >/dev/null 2>&1", capture=False)
+def _get_local_interface() -> tuple[str, str] | tuple[None, None]:
+    """
+    Return (interface_name, local_subnet) for the first non-loopback interface
+    that has a default route. e.g. ('eth0', '192.168.10.0/24').
+    """
+    # Find the interface used by the default route
+    _, route_out = run_cmd("ip -4 route show default", capture=False)
+    iface = None
+    for line in route_out.splitlines():
+        parts = line.split()
+        if "dev" in parts:
+            iface = parts[parts.index("dev") + 1]
+            break
+
+    if not iface:
+        return None, None
+
+    # Get the subnet assigned to that interface
+    _, addr_out = run_cmd(f"ip -4 route show dev {iface}", capture=False)
+    for line in addr_out.splitlines():
+        parts = line.split()
+        if parts and "/" in parts[0] and not parts[0].startswith("default"):
+            return iface, parts[0]   # e.g. ('eth0', '192.168.10.0/24')
+
+    return iface, None
 
 
-def _extract_redirect_hop(target_ip: str) -> str | None:
+def _candidate_gateways(local_subnet: str | None, default_gw: str | None) -> list[str]:
     """
-    Ping a host and extract the ICMP redirect next-hop if one is returned.
-    Returns the suggested gateway IP, or None if no redirect seen.
+    Build ordered list of gateway candidates to test.
+    Priority: default gw → .254 of local subnet → .1 of local subnet.
     """
-    _, out = run_cmd(f"ping -c 2 -W 1 {target_ip} 2>&1", capture=False)
-    for line in out.splitlines():
-        if "Redirect" in line and "nexthop" in line.lower():
-            # "From x.x.x.x ... Redirect Network(New nexthop: y.y.y.y)"
-            try:
-                return line.split("nexthop:")[-1].strip().rstrip(")")
-            except Exception:
-                pass
-    return None
+    candidates: list[str] = []
+    if default_gw:
+        candidates.append(default_gw)
+
+    if local_subnet:
+        prefix = ".".join(local_subnet.split("/")[0].split(".")[:3])
+        for last_octet in ("254", "1", "2"):
+            cand = f"{prefix}.{last_octet}"
+            if cand not in candidates:
+                candidates.append(cand)
+
+    return candidates
 
 
 def auto_route(subnets: list[str]):
     """
-    Automatically inject routes to target subnets.
-    Accepts ICMP redirects so the kernel follows switch/router hints,
-    then re-routes through the redirect-suggested hop if ping still fails.
+    Gateway Hunter — dynamically finds the correct next-hop for each target
+    subnet using active TCP reachability tests instead of ICMP ping/redirects.
+
+    For each subnet:
+      1. Generate candidate gateways (default gw, .254, .1, .2 of local net)
+      2. Inject route via candidate
+      3. TCP-probe a real host in that subnet on port 22 (1-second timeout)
+      4. If connection succeeds → keep route, move on
+      5. If fails → delete route, try next candidate
+      6. If all candidates fail → log error, skip subnet
     """
-    # Step 1: allow kernel to accept ICMP redirects (disabled by default on Kali)
-    _accept_icmp_redirects()
-
-    gw = _find_gateway()
-    if not gw:
-        warn("Could not determine default gateway — routes may be missing")
-        return
-
-    info(f"Default gateway: {gw}")
-
-    # Map each subnet to a real host IP to ping — network IDs (.0) don't respond
-    SUBNET_PING_HOST = {
-        CFG["nmap"]["idmz_subnet"]: CFG["historian"]["ip"],
-        "10.20.20.0/24":            CFG["plc"]["ip"],
+    # Map each subnet to a real host to TCP-probe (not the network address)
+    SUBNET_PROBE = {
+        CFG["nmap"]["idmz_subnet"]: (CFG["historian"]["ip"], 22),
+        "10.20.20.0/24":            (CFG["plc"]["ip"],       44818),
     }
 
-    target_subnets = list(set(subnets + _probe_gateway_for_subnets(gw)))
+    default_gw           = _find_gateway()
+    iface, local_subnet  = _get_local_interface()
 
-    for subnet in target_subnets:
-        # Use a real host for reachability checks, not the network address
-        ping_host = SUBNET_PING_HOST.get(subnet, subnet.split("/")[0])
+    info(f"Local interface : {iface}  subnet: {local_subnet}")
+    info(f"Default gateway : {default_gw}")
 
-        _inject_route(subnet, gw)
+    candidates = _candidate_gateways(local_subnet, default_gw)
+    info(f"Gateway candidates to test: {candidates}")
 
-        _, ping_out = run_cmd(f"ping -c 2 -W 1 {ping_host} 2>&1", capture=False)
-        reachable = "bytes from" in ping_out
+    for subnet in subnets:
+        probe_ip, probe_port = SUBNET_PROBE.get(subnet, (subnet.split("/")[0], 22))
+        info(f"Hunting route to {subnet}  (will TCP-probe {probe_ip}:{probe_port})")
 
-        if not reachable:
-            redirect_hop = _extract_redirect_hop(ping_host)
-            if redirect_hop and redirect_hop != gw:
-                info(f"ICMP redirect detected — re-routing {subnet} via {redirect_hop}")
-                run_cmd(f"sudo ip route del {subnet} 2>/dev/null || true", capture=False)
-                _inject_route(subnet, redirect_hop)
-                _, ping2 = run_cmd(f"ping -c 2 -W 1 {ping_host} 2>&1", capture=False)
-                if "bytes from" in ping2:
-                    ok(f"Route OK: {subnet} via {redirect_hop} (ping {ping_host})")
-                else:
-                    warn(f"{subnet} still unreachable via {redirect_hop} — may be FortiGate policy")
+        routed = False
+        for gw in candidates:
+            # Clean up any existing route for this subnet first
+            run_cmd(f"sudo ip route del {subnet} 2>/dev/null || true", capture=False)
+            # Inject candidate route
+            run_cmd(f"sudo ip route add {subnet} via {gw} 2>/dev/null || true", capture=False)
+
+            # Active TCP test — no ping, no ICMP, straight to the port
+            if _tcp_reachable(probe_ip, probe_port, timeout=1.0):
+                ok(f"Route confirmed: {subnet} via [bold]{gw}[/bold]  "
+                   f"(TCP {probe_ip}:{probe_port} reachable)")
+                routed = True
+                break
             else:
-                warn(f"{subnet} unreachable — no redirect hint found (check FortiGate policy)")
-        else:
-            ok(f"Route OK: {subnet} via {gw} (ping {ping_host})")
+                console.print(f"  [dim]via {gw} → {probe_ip}:{probe_port} unreachable, trying next...[/dim]")
+                run_cmd(f"sudo ip route del {subnet} 2>/dev/null || true", capture=False)
+
+        if not routed:
+            err(f"No valid route found for {subnet} — "
+                f"tried {candidates}. Check FortiGate policy or add route manually.")
 
 
 def preflight_check():
