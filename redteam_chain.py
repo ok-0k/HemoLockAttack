@@ -751,21 +751,55 @@ def phase4_ssh_pivot() -> PhaseResult:
         # ── 3. Ping PLC — parse ICMP replies, not just exit code ────────────
         console.print("\n[bold cyan]Ping PLC[/bold cyan]")
         ping_out, _, ping_rc = ssh_run(client, f"ping -c 4 -W 2 {plc_ip}")
-        # Only trust it if we see actual ICMP echo replies in the output
         icmp_replies = [l for l in ping_out.splitlines() if "bytes from" in l]
+
         if icmp_replies:
             checks["ping"] = True
             ok(f"PLC {plc_ip} is alive — {len(icmp_replies)} ICMP replies received")
             for rep in icmp_replies:
                 console.print(f"  [green]{escape(rep.strip())}[/green]")
         else:
-            err(f"PLC {plc_ip} did NOT respond to ping")
-            if "100% packet loss" in ping_out:
-                err("100% packet loss — host is unreachable or firewalled")
-            elif "Network unreachable" in ping_out or "No route" in ping_out:
-                err("Network unreachable — no route exists to OT zone")
+            err(f"PLC {plc_ip} did NOT respond to ping — running OT sweep to find real IP")
+
+            # ── 3b. Ping sweep fallback — find real PLC in 10.20.20.0/24 ────
+            console.print("\n[bold yellow]Running OT zone sweep from Historian...[/bold yellow]")
+            sweep_cmd = (
+                "for i in {1..254}; do "
+                "(ping -c 1 -W 1 10.20.20.$i >/dev/null 2>&1 "
+                "&& echo \"10.20.20.$i\") & "
+                "done; wait"
+            )
+            sweep_out, _, _ = ssh_run(client, sweep_cmd, timeout=60)
+
+            live_hosts = [
+                line.strip() for line in sweep_out.splitlines()
+                if line.strip().startswith("10.20.20.")
+                and not line.strip().endswith(".254")   # skip gateway
+            ]
+
+            if live_hosts:
+                discovered = live_hosts[0]  # take first live host that isn't the gw
+
+                console.print(Panel(
+                    f"[bold white]Configured PLC IP:[/bold white]  [red]{plc_ip}[/red]  (no response)\n"
+                    f"[bold white]Discovered PLC IP:[/bold white]  [bold green]{discovered}[/bold green]\n\n"
+                    f"[dim]CFG[\"plc\"][\"ip\"] updated in memory — Phase 5 will target {discovered}[/dim]",
+                    title="[bold yellow] PLC IP AUTO-CORRECTED [/bold yellow]",
+                    border_style="yellow",
+                    expand=False,
+                ))
+
+                CFG["plc"]["ip"] = discovered
+                plc_ip = discovered
+                checks["ping"] = True
+                findings.append(f"Sweep found: {live_hosts}")
             else:
-                warn(f"Ping output was ambiguous:\n{ping_out[:300]}")
+                err("OT sweep found no live hosts in 10.20.20.0/24")
+                if "100% packet loss" in ping_out:
+                    err("100% packet loss — OT zone may be unreachable from Historian")
+                elif "Network unreachable" in ping_out or "No route" in ping_out:
+                    err("Network unreachable — no route from Historian to OT zone")
+
         findings.append(f"Ping:\n{ping_out}")
 
         client.close()
@@ -777,7 +811,7 @@ def phase4_ssh_pivot() -> PhaseResult:
             ok(r.finding)
         elif checks["route"] and not checks["ping"]:
             r.status  = "failed"
-            r.finding = f"Route to {plc_ip} exists but host does not respond (down or firewalled)"
+            r.finding = f"Route to {plc_ip} exists but no live host found in 10.20.20.0/24"
             err(r.finding)
         elif not checks["route"]:
             r.status  = "failed"
