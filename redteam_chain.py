@@ -1051,8 +1051,14 @@ def _start_plc_proxy(ids_transport: paramiko.Transport,
     """
     import threading
 
+    # Free the port if a previous run left it bound
+    run_cmd(f"fuser -k {local_port}/tcp 2>/dev/null || true", capture=False)
+    time.sleep(0.3)
+
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    if hasattr(socket, "SO_REUSEPORT"):
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
     srv.bind(("127.0.0.1", local_port))
     srv.listen(5)
     srv.settimeout(60)
