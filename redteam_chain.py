@@ -1159,7 +1159,7 @@ def phase5_plc_attack() -> PhaseResult:
         for slot in CIP_SLOTS:
             path = f"127.0.0.1{slot}"
             info(f"Trying CIP path: {path!r}")
-            drv = LogixDriver(path)
+            drv = LogixDriver(path, init_info=False)
             try:
                 drv.open()
                 plc_conn     = drv
