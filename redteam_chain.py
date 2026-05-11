@@ -973,11 +973,22 @@ def phase4_ssh_pivot() -> PhaseResult:
         console.print(sweep_table)
 
         PORT_PRIORITY = ["44818", "502", "102"]
-        best = None
-        for preferred_port in PORT_PRIORITY:
-            best = next((d for d in discovered_devices if d["port"] == preferred_port), None)
-            if best:
-                break
+
+        # Prefer the already-configured IP if it showed up in the sweep —
+        # only fall back to the first discovered device if ours is absent.
+        configured_hits = [d for d in discovered_devices if d["ip"] == plc_ip]
+        if configured_hits:
+            # Pick the hit with the highest-priority port
+            best = next(
+                (h for pp in PORT_PRIORITY for h in configured_hits if h["port"] == pp),
+                configured_hits[0],
+            )
+        else:
+            best = None
+            for preferred_port in PORT_PRIORITY:
+                best = next((d for d in discovered_devices if d["port"] == preferred_port), None)
+                if best:
+                    break
 
         if best:
             old_plc_ip = plc_ip
@@ -1182,10 +1193,16 @@ def phase5_plc_attack() -> PhaseResult:
             info("Enumerating PLC tag list...")
             all_tags = plc_conn.get_tag_list()
 
+            # get_tag_list() returns dicts: {"tag_name": ..., "data_type": ..., ...}
+            def _tname(t) -> str:
+                return t.get("tag_name", "") if isinstance(t, dict) else str(getattr(t, "tag_name", ""))
+            def _ttype(t) -> str:
+                return t.get("data_type", "") if isinstance(t, dict) else str(getattr(t, "data_type", ""))
+
             filtered = [
                 t for t in all_tags
-                if any(kw in t.tag_name.lower() for kw in INTERESTING)
-                and str(t.data_type).upper() in NUMERIC_TYPES
+                if any(kw in _tname(t).lower() for kw in INTERESTING)
+                and _ttype(t).upper() in NUMERIC_TYPES
             ]
 
             tag_table = Table(
@@ -1195,7 +1212,7 @@ def phase5_plc_attack() -> PhaseResult:
             tag_table.add_column("Tag Name",  style="green",  width=36)
             tag_table.add_column("Data Type", style="yellow", width=12)
             for t in filtered:
-                tag_table.add_row(t.tag_name, str(t.data_type))
+                tag_table.add_row(_tname(t), _ttype(t))
             console.print(tag_table)
 
             if not filtered:
@@ -1204,7 +1221,7 @@ def phase5_plc_attack() -> PhaseResult:
                 all_table.add_column("Tag Name",  style="dim green",  width=36)
                 all_table.add_column("Data Type", style="dim yellow", width=12)
                 for t in all_tags[:40]:
-                    all_table.add_row(t.tag_name, str(t.data_type))
+                    all_table.add_row(_tname(t), _ttype(t))
                 console.print(all_table)
 
             # ── Validate configured tag; prompt if missing ────────────────────
