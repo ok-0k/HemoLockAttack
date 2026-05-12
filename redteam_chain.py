@@ -5,6 +5,7 @@ import subprocess
 import sys
 import os
 import io
+import re
 import time
 import json
 import argparse
@@ -621,16 +622,17 @@ def phase1_wifi_crack() -> PhaseResult:
                     f"sudo aircrack-ng {cap_file} -w {wl_arg}", timeout=300
                 )
                 if "KEY FOUND" in out:
-                    key_line = next(
-                        (l for l in out.splitlines() if "KEY FOUND" in l), "KEY FOUND"
-                    )
-                    # Extract password from "KEY FOUND! [ password ]"
+                    # Strip ANSI escape sequences before parsing — aircrack-ng
+                    # embeds cursor-movement codes that corrupt naive extraction.
+                    clean_out = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", out)
+
                     found_password = ""
-                    if "[" in key_line and "]" in key_line:
-                        found_password = key_line[key_line.index("[")+1 : key_line.index("]")].strip()
+                    match = re.search(r"KEY FOUND!\s*\[\s*(.*?)\s*\]", clean_out)
+                    if match:
+                        found_password = match.group(1).strip()
 
                     r.status  = "success"
-                    r.finding = key_line
+                    r.finding = f"KEY FOUND! [ {found_password} ]" if found_password else "KEY FOUND"
                     r.output  = out[-1000:]
                     ok(r.finding)
 
