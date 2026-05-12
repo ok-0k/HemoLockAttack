@@ -1328,7 +1328,7 @@ def phase5_plc_attack() -> PhaseResult:
     ids_pkey: "paramiko.PKey | None" = CFG["ids"].get("private_key")
 
     LOCAL_PORT  = 44818
-    INTERESTING = {"dose", "rate", "pump", "speed", "flow", "setpoint", "cmd", "hz"}
+    INTERESTING = {"dose", "rate", "pump", "speed", "flow", "setpoint", "cmd", "hz", "local:"}
     NUMERIC_TYPES = {"REAL", "DINT", "INT", "LINT", "SINT", "UDINT", "UINT"}
     # Allen-Bradley ControlLogix CPUs can live in different backplane slots
     CIP_SLOTS = ["", "/0", "/1", "/2", "/3"]
