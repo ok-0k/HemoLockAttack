@@ -341,9 +341,9 @@ def _probe_gateway_for_subnets(gateway: str) -> list[str]:
     # Sweep private ranges quickly — hosts that reply must be routable via gw
     sweep_targets = "10.0.0.0/8 172.16.0.0/12 192.168.0.0/16"
     rc, out = run_cmd(
-        f"sudo nmap -T4 -n --open -sn --send-eth "
-        f"--script='' {sweep_targets} 2>/dev/null | grep 'Nmap scan report'",
-        timeout=20, capture=False
+        f"sudo nmap -T5 -n -sn -PS22,80,443,44818 --max-retries 1 "
+        f"{sweep_targets} 2>/dev/null | grep 'Nmap scan report'",
+        timeout=30, capture=False
     )
     found: set[str] = set()
     for line in out.splitlines():
@@ -403,11 +403,6 @@ def auto_route(subnets: list[str]):
       3. TCP-probe a known host on 4 s timeout (FortiGate SYN-proxy safe)
       4. Keep route on first success; delete and try next on failure
     """
-    SUBNET_PROBE = {
-        CFG["nmap"]["idmz_subnet"]: (CFG["historian"]["ip"], 22),
-        "10.20.20.0/24":            (CFG["ids"]["ip"],       22),
-    }
-
     wifi_iface           = CFG["wifi"]["interface"]
     default_gw           = _find_gateway()
     iface, local_subnet  = _get_local_interface()
@@ -419,15 +414,7 @@ def auto_route(subnets: list[str]):
     info(f"Gateway candidates: {candidates}")
 
     for subnet in subnets:
-        if subnet in SUBNET_PROBE:
-            probe_ip, probe_port = SUBNET_PROBE[subnet]
-        else:
-            # Unknown subnet — probe its .1 gateway address on port 22 then 80
-            prefix       = ".".join(subnet.split("/")[0].split(".")[:3])
-            probe_ip     = f"{prefix}.1"
-            probe_port   = 22
-            info(f"Unknown subnet {subnet} — defaulting probe to {probe_ip}:{probe_port}")
-        info(f"Hunting route to {subnet}  (TCP-probe {probe_ip}:{probe_port})")
+        info(f"Hunting route to {subnet}...")
 
         routed = False
         for gw in candidates:
@@ -438,13 +425,18 @@ def auto_route(subnets: list[str]):
                 capture=False,
             )
 
-            if _tcp_reachable(probe_ip, probe_port, timeout=4.0):
+            info(f"Testing route to {subnet} via {gw}...")
+            rc, out = run_cmd(
+                f"sudo nmap -sn -PS22,80,443,44818 -T5 --max-retries 1 {subnet} 2>/dev/null",
+                timeout=15, capture=False,
+            )
+            if "Host is up" in out:
                 ok(f"Route confirmed: {subnet} via [bold]{gw}[/bold] dev {wifi_iface}  "
-                   f"(TCP {probe_ip}:{probe_port} reachable)")
+                   f"(Live hosts detected)")
                 routed = True
                 break
 
-            console.print(f"  [dim]via {gw} → {probe_ip}:{probe_port} unreachable, trying next...[/dim]")
+            console.print(f"  [dim]via {gw} → no live hosts in {subnet}, trying next...[/dim]")
             run_cmd(f"sudo ip route del {subnet} 2>/dev/null || true", capture=False)
 
         if not routed:
@@ -1482,7 +1474,10 @@ def phase5_plc_attack() -> PhaseResult:
             def _tname(t) -> str:
                 return t.get("tag_name", "") if isinstance(t, dict) else str(getattr(t, "tag_name", ""))
             def _ttype(t) -> str:
-                return t.get("data_type", "") if isinstance(t, dict) else str(getattr(t, "data_type", ""))
+                dt = t.get("data_type", "Unknown") if isinstance(t, dict) else getattr(t, "data_type", "Unknown")
+                if isinstance(dt, dict):
+                    return str(dt.get("name", "STRUCT"))
+                return str(dt)
 
             filtered = [
                 t for t in all_tags
@@ -1763,7 +1758,10 @@ def phase5_cip_enum() -> PhaseResult:
     def _tname(t) -> str:
         return t.get("tag_name", "") if isinstance(t, dict) else str(getattr(t, "tag_name", ""))
     def _ttype(t) -> str:
-        return t.get("data_type", "") if isinstance(t, dict) else str(getattr(t, "data_type", ""))
+        dt = t.get("data_type", "Unknown") if isinstance(t, dict) else getattr(t, "data_type", "Unknown")
+        if isinstance(dt, dict):
+            return str(dt.get("name", "STRUCT"))
+        return str(dt)
     def _is_noise(name: str) -> bool:
         return (
             name.startswith("__")
@@ -1866,7 +1864,9 @@ def phase5_cip_enum() -> PhaseResult:
                 value_str    = "[bold red]ACCESS DENIED[/bold red]"
                 reads_denied += 1
 
-            tbl.add_row(str(i), escape(name), escape(dtype), value_str)
+            name_str  = str(escape(name))
+            dtype_str = str(escape(dtype))
+            tbl.add_row(str(i), name_str, dtype_str, value_str)
 
         console.print(tbl)
         console.print()
