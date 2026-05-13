@@ -605,7 +605,7 @@ def phase1_wifi_crack() -> PhaseResult:
 
             wifite_cmd = (
                 f"sudo wifite --bssid {bssid} -i {iface} "
-                f"--wpa --dict {wl_arg} --wpatime 60 --random-mac"
+                f"--wpa --dict {wl_arg} --wpat 60 --nodeauths --random-mac"
             )
             rc, out = run_cmd(wifite_cmd, timeout=300)
 
