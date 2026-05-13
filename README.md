@@ -116,4 +116,4 @@ This tool was developed exclusively for use in the BCIT INCS 4810 authorized lab
 
 **Defense:** Suricata, Zeek, Grafana, InfluxDB, rsyslog, Cowrie
 
-**Hardware:** Allen Bradley PLC, Raspberry Pi 5 ×4, FortiGate Rugged 60D, Cisco IE-2000 ×2, Cisco WLC 3500, C9120AXI AP, MasterFlex Peristaltic Pump
+**Hardware:** Allen Bradley PLC, Raspberry Pi 5 ×4, FortiGate Rugged 60D, Cisco IE-2000 ×2, NETGEAR AP, MasterFlex Peristaltic Pump
