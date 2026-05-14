@@ -1916,8 +1916,7 @@ def phase8_direct_io_inject() -> PhaseResult:
     phase_header(8, "Direct Remote I/O Injection (Bypass PLC Logic)")
     r = PhaseResult("Direct I/O Inject")
 
-    from pycomm3 import LogixDriver, CIPError
-    from pycomm3.packets import RequestPacket
+    from pycomm3 import LogixDriver, CommError
 
     plc_ip  = CFG["plc"]["ip"]
     LOCAL_PORT = 44818
