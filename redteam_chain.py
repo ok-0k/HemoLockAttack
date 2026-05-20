@@ -389,28 +389,63 @@ def _ip_to_slash24(ip: str) -> str | None:
     return None
 
 
+def _is_lab_subnet(subnet: str) -> bool:
+    """
+    Hard allowlist: only accept RFC-1918 private subnets.
+    Silently rejects public IPs, school networks, internet hops —
+    anything traceroute or nmap could have picked up outside the lab.
+    Allowed: 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
+    """
+    import ipaddress
+    try:
+        return ipaddress.ip_network(subnet, strict=False).is_private
+    except ValueError:
+        return False
+
+
+def _assert_lab_target(cmd: str):
+    """
+    Hard safety net: raise RuntimeError if an nmap command targets a public IP.
+    Called before every nmap invocation so accidental public scanning is impossible.
+    """
+    import ipaddress
+    for token in cmd.split():
+        # strip trailing slashes / masks that aren't valid CIDR on their own
+        token = token.split(" ")[0]
+        try:
+            net = ipaddress.ip_network(token, strict=False)
+            if not net.is_private:
+                raise RuntimeError(
+                    f"SAFETY BLOCK: nmap target '{token}' is a public IP — aborting"
+                )
+        except ValueError:
+            pass   # not an IP token
+
+
 def _probe_gateway_for_subnets(gateway: str) -> list[str]:
     """
-    Discover FOREIGN (non-local) /24 subnets reachable via the gateway.
-    Four layers, tried in order — stops as soon as any layer finds subnets.
+    Discover target /24 subnets scoped strictly to the lab.
+    Does NOT use traceroute — traceroute follows packets to the internet
+    and turns every public hop into a false-positive scan target.
 
-    Layer 1 — Route table  : non-default, non-local routes already installed
-    Layer 2 — Traceroute   : hop IPs toward CFG known targets reveal transit subnets
-    Layer 3 — FortiGate/TTL: ping common IDMZ addresses with TTL probes
-    Layer 4 — Targeted sweep: 10.10/10.20/172.16 chunks, capped 60 s
+    Source 1 — Routing table : non-default routes already installed (instant).
+    Source 2 — CFG inference : /24 of historian / IDS / PLC IPs (zero packets).
+    Source 3 — Targeted sweep: 10.10.x / 10.20.x nmap sweep (last resort, 60 s cap).
+
+    Every candidate is run through _is_lab_subnet() before being accepted.
     """
-    iface = CFG["wifi"]["interface"]
     _, local_subnet = _get_local_interface()
     local_prefix = _ip_to_slash24(local_subnet.split("/")[0]) if local_subnet else None
 
     found: set[str] = set()
 
-    def _add_if_foreign(ip_or_net: str):
+    def _add(ip_or_net: str):
+        """Accept only RFC-1918 subnets that are not the local wlan0 subnet."""
         slash24 = _ip_to_slash24(ip_or_net.split("/")[0])
-        if slash24 and slash24 != local_prefix and not ip_or_net.startswith("169.254"):
+        if slash24 and slash24 != local_prefix and _is_lab_subnet(slash24):
             found.add(slash24)
 
-    # ── Layer 1: routing table (free — zero packets) ──────────────────────────
+    # ── Source 1: existing routing table entries (zero packets) ──────────────
     _, route_out = run_cmd("ip route show", capture=False, silent=True)
     for line in route_out.splitlines():
         parts = line.split()
@@ -418,73 +453,34 @@ def _probe_gateway_for_subnets(gateway: str) -> list[str]:
             continue
         net = parts[0]
         if "/" in net:
-            _add_if_foreign(net)
+            _add(net)
+
+    # ── Source 2: CFG ground-truth targets (zero packets) ────────────────────
+    for ip in (CFG["historian"]["ip"], CFG["ids"]["ip"], CFG["plc"]["ip"]):
+        _add(ip)
 
     if found:
         return list(found)
 
-    # ── Layer 2: traceroute toward CFG known IPs ───────────────────────────────
-    cfg_targets = [CFG["historian"]["ip"], CFG["ids"]["ip"], CFG["plc"]["ip"]]
-    for target_ip in cfg_targets:
-        _, tr_out = run_cmd(
-            f"traceroute -n -m 5 -w 2 {target_ip} 2>/dev/null",
-            timeout=18, capture=False, silent=True,
-        )
-        for line in tr_out.splitlines():
-            # each hop line: " 2  10.10.10.1  2.1 ms  ..."
-            for token in line.split():
-                try:
-                    socket.inet_aton(token)
-                    _add_if_foreign(token)
-                except OSError:
-                    pass
-
-    if found:
-        return list(found)
-
-    # ── Layer 3: FortiGate gateway probe + TTL-based IDMZ inference ───────────
-    # Check gateway for FortiGate management ports
-    run_cmd(
-        f"sudo nmap -sV -p 443,8443,541,4443 --open {gateway} 2>/dev/null",
-        timeout=12, capture=False, silent=True,
-    )
-    # Send TTL-limited packets toward common IDMZ gateway IPs — any hop reply
-    # confirms a routable path exists to that network
-    common_idmz = ["10.10.10.1", "10.10.10.20", "10.20.20.1", "172.16.10.1"]
-    for probe_ip in common_idmz:
-        _, tr_out = run_cmd(
-            f"traceroute -n -m 3 -w 1 {probe_ip} 2>/dev/null",
-            timeout=8, capture=False, silent=True,
-        )
-        for line in tr_out.splitlines():
-            for token in line.split():
-                try:
-                    socket.inet_aton(token)
-                    _add_if_foreign(token)
-                except OSError:
-                    pass
-
-    if found:
-        return list(found)
-
-    # ── Layer 4: targeted RFC-1918 sweep, 10.10/10.20 priority ───────────────
+    # ── Source 3: targeted nmap sweep of known OT ranges only (last resort) ──
     priority_chunks: list[str] = []
     for third in range(1, 25):
         priority_chunks.append(f"10.10.{third}.0/24")
     for third in range(20, 30):
         priority_chunks.append(f"10.20.{third}.0/24")
-    for third in range(16, 32):
-        priority_chunks.append(f"172.16.{third}.0/24")
-    priority_chunks = [c for c in priority_chunks
-                       if _ip_to_slash24(c.split("/")[0]) != local_prefix]
+    # Exclude local subnet and anything non-private (safety net)
+    priority_chunks = [
+        c for c in priority_chunks
+        if _ip_to_slash24(c.split("/")[0]) != local_prefix and _is_lab_subnet(c)
+    ]
 
-    # Sweep in batches of 8 /24s, stop early if we find something
     batch_size = 8
     deadline   = time.monotonic() + 60
     for i in range(0, len(priority_chunks), batch_size):
         if time.monotonic() > deadline:
             break
         batch = " ".join(priority_chunks[i:i + batch_size])
+        _assert_lab_target(batch)
         _, out = run_cmd(
             f"sudo nmap -T5 -n -sn -PS22,44818 --max-retries 0 {batch} 2>/dev/null"
             " | grep 'Nmap scan report'",
@@ -493,7 +489,7 @@ def _probe_gateway_for_subnets(gateway: str) -> list[str]:
         for line in out.splitlines():
             parts = line.strip().split()
             if parts:
-                _add_if_foreign(parts[-1])
+                _add(parts[-1])
         if found:
             break
 
@@ -581,6 +577,7 @@ def _inject_route_silent(subnet: str, via: str, iface: str):
 
 def _ping_sweep_silent(subnet: str, timeout: int = 10) -> bool:
     """Return True if nmap finds at least one live host in subnet (silent)."""
+    _assert_lab_target(subnet)
     _, out = run_cmd(
         f"sudo nmap -sn -PS22,80,443,44818 -T5 --max-retries 0 {subnet} 2>/dev/null",
         timeout=timeout, capture=False, silent=True,
@@ -1193,7 +1190,7 @@ def phase2_idmz_recon() -> PhaseResult:
     with Progress(SpinnerColumn(), TextColumn("[cyan]{task.description}"),
                   TimeElapsedColumn(), console=console, transient=True) as prog:
         task = prog.add_task(
-            "Discovering IDMZ subnets — trying route table, traceroute, gateway scan...",
+            "Discovering IDMZ subnets — routing table + CFG inference...",
             total=None,
         )
 
@@ -1201,7 +1198,7 @@ def phase2_idmz_recon() -> PhaseResult:
         if not gateway:
             pass   # handled below
         else:
-            prog.update(task, description=f"Gateway: {gateway} — probing reachable subnets...")
+            prog.update(task, description=f"Gateway: {gateway} — resolving target subnets...")
             discovered_subnets = _probe_gateway_for_subnets(gateway)
 
     if not gateway:
@@ -1211,15 +1208,21 @@ def phase2_idmz_recon() -> PhaseResult:
         return r
     ok(f"Gateway: [bold]{gateway}[/bold]")
 
+    # Hard-filter: drop anything non-RFC-1918 and the local wlan0 subnet
+    discovered_subnets = [
+        sn for sn in discovered_subnets
+        if _is_lab_subnet(sn) and _ip_to_slash24(sn.split("/")[0]) != local_prefix
+    ]
+
     if not discovered_subnets:
         r.status  = "failed"
-        r.finding = "No foreign subnets discovered — verify routing table and association"
+        r.finding = "No lab subnets discovered — verify routing table and CFG IPs"
         err(r.finding)
         return r
 
     # Sort by proximity: IDMZ hint first, deep OT last
     ordered_subnets = _prioritise_subnets(discovered_subnets, local_subnet)
-    ok(f"Discovered subnets (priority order): {', '.join(ordered_subnets)}")
+    ok(f"Target subnets (priority order): {', '.join(ordered_subnets)}")
 
     # ── Step 3: inject routes — non-blocking, defers unreachable subnets ─────
     info("Injecting routes for discovered subnets...")
@@ -1238,17 +1241,33 @@ def phase2_idmz_recon() -> PhaseResult:
     all_nmap_out = ""
     live_hosts: dict[str, list[str]] = {}
 
+    historian_cfg_ip = CFG["historian"]["ip"]
+
     for subnet in routed_subnets:
+        # Safety: never scan public IPs even if somehow one slipped through
+        _assert_lab_target(subnet)
+
         info(f"Ping sweep: {subnet}...")
         if not _ping_sweep_silent(subnet, timeout=10):
             warn(f"  No live hosts in {subnet} — skipping full port scan")
             continue
 
         nmap_cmd = f"sudo nmap -T4 -n -sS -Pn -p {ports} --open {subnet}"
+        _assert_lab_target(nmap_cmd)
         info(f"Port scan: {subnet}  ({ports})")
         _, out   = stream_cmd(nmap_cmd, timeout=120, line_filter=_nmap_filter)
         all_nmap_out += out
         live_hosts.update(_parse_nmap_hosts(out))
+
+        # Early-exit: stop scanning further subnets once the Historian is found.
+        # Condition: the CFG historian IP appeared, OR there is exactly one SSH host.
+        ssh_hosts = [ip for ip, pts in live_hosts.items() if "22" in pts]
+        if historian_cfg_ip in live_hosts or len(ssh_hosts) == 1:
+            if len(routed_subnets) > 1:
+                remaining = [s for s in routed_subnets if s != subnet]
+                info(f"Historian candidate found — skipping remaining subnets: "
+                     f"{', '.join(remaining)}")
+            break
 
     if not live_hosts:
         r.status  = "failed"
