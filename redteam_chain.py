@@ -181,16 +181,19 @@ def info(msg: str):
     console.print(f"[bold blue] ●[/bold blue] [blue]{msg}[/blue]")
 
 
-def run_cmd(cmd: str, timeout: int = 120, capture: bool = True) -> tuple[int, str]:
-    """Run a shell command silently, return (returncode, stdout+stderr)."""
-    console.print(f"[dim]$ {escape(cmd)}[/dim]")
+def run_cmd(cmd: str, timeout: int = 120, capture: bool = True,
+            silent: bool = False) -> tuple[int, str]:
+    """Run a shell command, return (returncode, stdout+stderr).
+    silent=True suppresses the '$ cmd' prefix line (use for route plumbing noise)."""
+    if not silent:
+        console.print(f"[dim]$ {escape(cmd)}[/dim]")
     try:
         proc = subprocess.run(
             cmd, shell=True, timeout=timeout,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True
         )
-        if capture:
+        if capture and not silent:
             console.print(f"[dim]{escape(proc.stdout[-2000:])}[/dim]")
         return proc.returncode, proc.stdout
     except subprocess.TimeoutExpired:
@@ -368,35 +371,69 @@ def _find_gateway() -> str | None:
     return None
 
 
-def _inject_route(subnet: str, via: str):
-    """Add a host route silently; ignore error if it already exists."""
-    run_cmd(f"sudo ip route add {subnet} via {via} 2>/dev/null || true", capture=False)
+
+def _ip_to_slash24(ip: str) -> str | None:
+    """Convert an IP string to its /24 network string, or None if invalid."""
+    parts = ip.strip("()").split(".")
+    if len(parts) == 4:
+        try:
+            [int(p) for p in parts]
+            return ".".join(parts[:3]) + ".0/24"
+        except ValueError:
+            pass
+    return None
 
 
 def _probe_gateway_for_subnets(gateway: str) -> list[str]:
     """
-    Send a quick nmap ping sweep through the gateway to discover
-    which subnets are reachable, then infer /24 networks from live hosts.
-    Works by doing a broad sweep of RFC-1918 space that the gateway routes.
+    Discover reachable /24 subnets in three escalating stages:
+
+    Stage 1 — Free: parse `ip route show` for already-installed non-default routes.
+    Stage 2 — Cheap: derive subnets from the ARP/neigh cache (already-known IPs).
+    Stage 3 — Last resort: broad RFC-1918 nmap sweep, capped at 30 s.
     """
-    info(f"Probing gateway {gateway} for reachable subnets...")
-    # Sweep private ranges quickly — hosts that reply must be routable via gw
-    sweep_targets = "10.0.0.0/8 172.16.0.0/12 192.168.0.0/16"
-    rc, out = run_cmd(
-        f"sudo nmap -T5 -n -sn -PS22,80,443,44818 --max-retries 1 "
-        f"{sweep_targets} 2>/dev/null | grep 'Nmap scan report'",
-        timeout=30, capture=False
-    )
     found: set[str] = set()
+    iface = CFG["wifi"]["interface"]
+
+    # Stage 1: existing routing table entries (instant, no packets)
+    _, route_out = run_cmd("ip route show", capture=False, silent=True)
+    for line in route_out.splitlines():
+        parts = line.split()
+        if not parts or parts[0] in ("default", "local", "broadcast"):
+            continue
+        net = parts[0]
+        if "/" in net and not net.startswith("169.254"):
+            # normalise to /24 if it's a host route or narrower
+            base = net.split("/")[0]
+            slash24 = _ip_to_slash24(base)
+            if slash24:
+                found.add(slash24)
+
+    # Stage 2: ARP/neigh cache — these IPs are definitely reachable
+    for ip in _arp_neighbors(iface):
+        slash24 = _ip_to_slash24(ip)
+        if slash24:
+            found.add(slash24)
+
+    if found:
+        info(f"Subnet discovery (route table + ARP): {', '.join(sorted(found))}")
+        return list(found)
+
+    # Stage 3: broad RFC-1918 nmap sweep — only if stages 1 & 2 found nothing
+    info("No subnets from route table/ARP — falling back to RFC-1918 sweep (30 s)...")
+    sweep_targets = "10.0.0.0/8 172.16.0.0/12 192.168.0.0/16"
+    _, out = run_cmd(
+        f"sudo nmap -T5 -n -sn -PS22,80,443,44818 --max-retries 0 "
+        f"{sweep_targets} 2>/dev/null | grep 'Nmap scan report'",
+        timeout=30, capture=False, silent=True,
+    )
     for line in out.splitlines():
-        # "Nmap scan report for 10.10.10.20" → extract /24
         parts = line.strip().split()
         if parts:
-            ip = parts[-1].strip("()")
-            segments = ip.split(".")
-            if len(segments) == 4:
-                net = ".".join(segments[:3]) + ".0/24"
-                found.add(net)
+            slash24 = _ip_to_slash24(parts[-1])
+            if slash24:
+                found.add(slash24)
+
     return list(found)
 
 
@@ -414,76 +451,204 @@ def _get_local_interface() -> tuple[str, str] | tuple[None, None]:
     return iface, None
 
 
+def _arp_neighbors(iface: str) -> list[str]:
+    """
+    Return IPs of already-known neighbours on `iface` from the ARP/neighbour cache.
+    These are already reachable — no probe needed — so they go to the front of
+    the gateway candidate list.
+    """
+    neighbors: list[str] = []
+    for cmd in (f"arp -n -i {iface}", f"ip neigh show dev {iface}"):
+        _, out = run_cmd(cmd, capture=False, silent=True)
+        for line in out.splitlines():
+            parts = line.split()
+            if not parts:
+                continue
+            # arp -n:   "10.10.10.1  ether  aa:bb:cc:dd:ee:ff  C  wlan0"
+            # ip neigh: "10.10.10.1 dev wlan0 lladdr aa:bb:cc:dd:ee:ff REACHABLE"
+            ip = parts[0]
+            try:
+                socket.inet_aton(ip)   # quick validity check
+            except OSError:
+                continue
+            if ip not in neighbors:
+                neighbors.append(ip)
+    return neighbors
+
+
 def _candidate_gateways(local_subnet: str | None, default_gw: str | None) -> list[str]:
     """
-    Build ordered gateway candidates from the wlan0 subnet only (.1, .2, .254).
-    The global default gateway is appended last as a last-resort fallback.
+    Build ordered gateway candidates:
+      1. ARP/neighbour cache entries on wlan0 (already reachable — no probe needed)
+      2. .1, .2, .254 of the wlan0 subnet
+      3. Global default gateway (may be eth0/VMware — lowest priority)
+    Duplicates are removed while preserving order.
     """
+    iface = CFG["wifi"]["interface"]
+    seen: set[str] = set()
     candidates: list[str] = []
 
+    def _add(ip: str):
+        if ip and ip not in seen:
+            seen.add(ip)
+            candidates.append(ip)
+
+    # ARP-first: already-known neighbours are cheapest to verify
+    for ip in _arp_neighbors(iface):
+        _add(ip)
+
+    # Subnet-derived .1 / .2 / .254
     if local_subnet:
         prefix = ".".join(local_subnet.split("/")[0].split(".")[:3])
         for last_octet in ("1", "2", "254"):
-            candidates.append(f"{prefix}.{last_octet}")
+            _add(f"{prefix}.{last_octet}")
 
-    # Global default gw as fallback (may be eth0/VMware — lower priority)
-    if default_gw and default_gw not in candidates:
-        candidates.append(default_gw)
+    # Default gateway as safety net
+    _add(default_gw)
 
     return candidates
 
 
+def _inject_route_silent(subnet: str, via: str, iface: str):
+    """Inject a route without printing anything to the console."""
+    run_cmd(f"sudo ip route del {subnet} 2>/dev/null || true",            silent=True, capture=False)
+    run_cmd(f"sudo ip route add {subnet} via {via} dev {iface} 2>/dev/null || true",
+            silent=True, capture=False)
+
+
+def _ping_sweep_silent(subnet: str, timeout: int = 10) -> bool:
+    """Return True if nmap finds at least one live host in subnet (silent)."""
+    _, out = run_cmd(
+        f"sudo nmap -sn -PS22,80,443,44818 -T5 --max-retries 0 {subnet} 2>/dev/null",
+        timeout=timeout, capture=False, silent=True,
+    )
+    return "Host is up" in out
+
+
 def auto_route(subnets: list[str]):
     """
-    Gateway Hunter — finds the correct next-hop for each target subnet using
-    active TCP probes.  Routes are bound to the Wi-Fi interface so the kernel
-    never falls back to eth0 / VMware NAT.
+    Gateway Hunter — parallel-probes all candidates simultaneously so the
+    first working gateway wins without waiting for sequential timeouts.
 
     For each subnet:
-      1. Generate gateway candidates from the wlan0 subnet (.1/.2/.254)
-      2. Inject route via candidate, bound to CFG["wifi"]["interface"]
-      3. TCP-probe a known host on 4 s timeout (FortiGate SYN-proxy safe)
-      4. Keep route on first success; delete and try next on failure
+      1. ARP-first candidates (already reachable)
+      2. Inject route via each candidate in parallel threads
+      3. First thread to see a live host sets the winner Event
+      4. Losers clean up their routes; winner's route is kept
+      5. If ALL fail → operator is shown a failure panel with r / m / q options
     """
-    wifi_iface           = CFG["wifi"]["interface"]
-    default_gw           = _find_gateway()
-    iface, local_subnet  = _get_local_interface()
+    wifi_iface          = CFG["wifi"]["interface"]
+    default_gw          = _find_gateway()
+    iface, local_subnet = _get_local_interface()
 
-    info(f"Wi-Fi interface : {iface}  subnet: {local_subnet}")
+    info(f"Wi-Fi interface : {iface}  local subnet: {local_subnet}")
     info(f"Default gateway : {default_gw}")
 
     candidates = _candidate_gateways(local_subnet, default_gw)
-    info(f"Gateway candidates: {candidates}")
+    info(f"Gateway candidates ({len(candidates)}): {candidates}")
 
     for subnet in subnets:
-        info(f"Hunting route to {subnet}...")
+        info(f"Routing {subnet} — probing {len(candidates)} gateways in parallel...")
 
-        routed = False
+        winner_gw: list[str] = []           # shared mutable cell — set by winning thread
+        won       = threading.Event()
+        probe_results: dict[str, bool] = {} # gw → success, filled after all threads finish
+        lock      = threading.Lock()
+
+        def _probe(gw: str, sn: str = subnet):
+            _inject_route_silent(sn, gw, wifi_iface)
+            alive = _ping_sweep_silent(sn, timeout=10)
+            with lock:
+                probe_results[gw] = alive
+            if alive and not won.is_set():
+                won.set()
+                winner_gw.append(gw)
+
+        threads = [threading.Thread(target=_probe, args=(gw,), daemon=True)
+                   for gw in candidates]
+        for t in threads:
+            t.start()
+
+        # Show a single spinner while waiting for all threads
+        with Progress(SpinnerColumn(), TextColumn("[cyan]{task.description}"),
+                      TimeElapsedColumn(), console=console, transient=True) as prog:
+            task = prog.add_task(
+                f"Probing {len(candidates)} gateway candidate(s) for {subnet}...", total=None
+            )
+            for t in threads:
+                t.join(timeout=12)
+
+        # Print compact summary table after all threads finish
+        summary = Table(show_header=True, header_style="bold cyan",
+                        border_style="dim", padding=(0, 1))
+        summary.add_column("Gateway",  style="yellow", width=18)
+        summary.add_column("Result",   width=20)
         for gw in candidates:
-            run_cmd(f"sudo ip route del {subnet} 2>/dev/null || true", capture=False)
-            # Bind route to Wi-Fi interface so the kernel ignores eth0
-            run_cmd(
-                f"sudo ip route add {subnet} via {gw} dev {wifi_iface} 2>/dev/null || true",
-                capture=False,
-            )
+            hit = probe_results.get(gw, False)
+            summary.add_row(gw, "[green]✔ Live hosts[/green]" if hit else "[dim]✘ No hosts[/dim]")
+        console.print(summary)
 
-            info(f"Testing route to {subnet} via {gw}...")
-            rc, out = run_cmd(
-                f"sudo nmap -sn -PS22,80,443,44818 -T5 --max-retries 1 {subnet} 2>/dev/null",
-                timeout=15, capture=False,
-            )
-            if "Host is up" in out:
-                ok(f"Route confirmed: {subnet} via [bold]{gw}[/bold] dev {wifi_iface}  "
-                   f"(Live hosts detected)")
-                routed = True
+        # Tear down losing routes silently
+        for gw in candidates:
+            if not winner_gw or gw != winner_gw[0]:
+                run_cmd(f"sudo ip route del {subnet} 2>/dev/null || true",
+                        silent=True, capture=False)
+
+        if winner_gw:
+            ok(f"Route confirmed: {subnet} via [bold]{winner_gw[0]}[/bold] dev {wifi_iface}")
+            continue
+
+        # ── All candidates failed — offer operator choices ────────────────────
+        while True:
+            console.print(Panel(
+                f"[bold red]✘  Route Discovery Failed — {subnet}[/bold red]\n\n"
+                "No live hosts found on any candidate gateway.\n"
+                "[dim]Verify: wlan0 is associated  |  FortiGate allows ICMP/TCP  |  lab is powered on[/dim]\n\n"
+                "  [bold]r[/bold]  →  Retry parallel gateway probe\n"
+                "  [bold]m[/bold]  →  Manually enter gateway IP\n"
+                "  [bold]q[/bold]  →  Skip this subnet and continue",
+                title="[bold red] Route Discovery Failed [/bold red]",
+                border_style="red", expand=False,
+            ))
+            choice = Prompt.ask("[red]Action[/red]", choices=["r", "m", "q"], default="r")
+
+            if choice == "q":
+                warn(f"Skipping route injection for {subnet}")
                 break
 
-            console.print(f"  [dim]via {gw} → no live hosts in {subnet}, trying next...[/dim]")
-            run_cmd(f"sudo ip route del {subnet} 2>/dev/null || true", capture=False)
+            if choice == "r":
+                # Re-run probe for this subnet
+                winner_gw.clear()
+                won.clear()
+                probe_results.clear()
+                threads2 = [threading.Thread(target=_probe, args=(gw,), daemon=True)
+                            for gw in candidates]
+                for t in threads2: t.start()
+                with Progress(SpinnerColumn(), TextColumn("[cyan]{task.description}"),
+                              TimeElapsedColumn(), console=console, transient=True) as prog:
+                    prog.add_task(f"Retrying {len(candidates)} candidate(s)...", total=None)
+                    for t in threads2: t.join(timeout=12)
+                if winner_gw:
+                    ok(f"Route confirmed on retry: {subnet} via {winner_gw[0]}")
+                    break
+                continue
 
-        if not routed:
-            err(f"No valid route found for {subnet} — tried {candidates}. "
-                f"Verify wlan0 is associated and FortiGate allows the traffic.")
+            if choice == "m":
+                manual_gw = Prompt.ask("[yellow]Enter gateway IP[/yellow]").strip()
+                try:
+                    socket.inet_aton(manual_gw)
+                except OSError:
+                    err("Invalid IP address — try again")
+                    continue
+                _inject_route_silent(subnet, manual_gw, wifi_iface)
+                info(f"Route injected: {subnet} via {manual_gw} — verifying...")
+                if _ping_sweep_silent(subnet, timeout=12):
+                    ok(f"Route confirmed: {subnet} via [bold]{manual_gw}[/bold]")
+                    break
+                else:
+                    err(f"No live hosts reachable via {manual_gw} — try a different gateway")
+                    run_cmd(f"sudo ip route del {subnet} 2>/dev/null || true",
+                            silent=True, capture=False)
 
 
 def preflight_check():
@@ -772,13 +937,26 @@ def _detect_cowrie(ip: str, port: int = 22) -> bool:
         return False   # timeout, refused, etc. — treat as real/unknown
 
 
+def _ssh_banner_grab(ip: str, port: int = 22, timeout: float = 4.0) -> str:
+    """
+    Connect to an SSH port and read the banner without authenticating.
+    Returns the raw banner string, or an empty string on failure.
+    """
+    try:
+        with socket.create_connection((ip, port), timeout=timeout) as s:
+            banner = s.recv(256).decode(errors="replace").strip()
+            return banner
+    except Exception:
+        return ""
+
+
 def phase2_idmz_recon() -> PhaseResult:
     phase_header(2, "IDMZ Recon (autonomous)")
     r = PhaseResult("IDMZ Recon")
 
     ports = CFG["nmap"]["ports"]
 
-    # ── Step 1: discover gateway and reachable subnets dynamically ────────────
+    # ── Step 1: discover gateway ──────────────────────────────────────────────
     info("Discovering Wi-Fi gateway...")
     gateway = _find_gateway()
     if not gateway:
@@ -788,25 +966,33 @@ def phase2_idmz_recon() -> PhaseResult:
         return r
     ok(f"Gateway: {gateway}")
 
-    info("Probing gateway for reachable subnets...")
+    # ── Step 2: subnet discovery (route table → ARP → RFC-1918 fallback) ──────
+    info("Discovering reachable subnets...")
     discovered_subnets = _probe_gateway_for_subnets(gateway)
     if not discovered_subnets:
-        warn("Subnet probe returned nothing — falling back to CFG idmz_subnet")
-        discovered_subnets = [CFG["nmap"]["idmz_subnet"]]
-    else:
-        ok(f"Discovered subnets: {', '.join(discovered_subnets)}")
+        r.status  = "failed"
+        r.finding = "No subnets discovered — verify wlan0 association and routing table"
+        err(r.finding)
+        return r
+    ok(f"Discovered subnets: {', '.join(discovered_subnets)}")
 
-    # ── Step 2: inject routes for every discovered subnet ─────────────────────
-    info("Injecting routes for all discovered subnets...")
+    # ── Step 3: inject routes (parallel, ARP-first, operator fallback) ────────
+    info("Injecting routes for discovered subnets...")
     auto_route(discovered_subnets)
 
-    # ── Step 3: nmap sweep across all discovered subnets ─────────────────────
+    # ── Step 4: fast ping sweep, then full port scan only on live subnets ─────
     all_nmap_out = ""
     live_hosts: dict[str, list[str]] = {}
 
     for subnet in discovered_subnets:
+        info(f"Ping sweep: {subnet}...")
+        alive = _ping_sweep_silent(subnet, timeout=10)
+        if not alive:
+            warn(f"  No live hosts in {subnet} — skipping full port scan")
+            continue
+
         nmap_cmd = f"sudo nmap -T4 -n -sS -Pn -p {ports} --open {subnet}"
-        info(f"Sweeping {subnet}  ports {ports}")
+        info(f"Port scan: {subnet}  ({ports})")
         rc, out  = stream_cmd(nmap_cmd, timeout=120, line_filter=_nmap_filter)
         all_nmap_out += out
         hosts = _parse_nmap_hosts(out)
@@ -819,67 +1005,149 @@ def phase2_idmz_recon() -> PhaseResult:
         r.output  = all_nmap_out[-2000:]
         return r
 
-    # ── Step 4: active Cowrie fingerprinting on every SSH-speaking host ───────
-    info("Fingerprinting SSH hosts for Cowrie honeypot signatures...")
+    # ── Step 5: active Cowrie fingerprinting ──────────────────────────────────
+    info("Fingerprinting SSH hosts for Cowrie signatures...")
     cowrie_flags: dict[str, bool] = {}
     for ip, open_ports in live_hosts.items():
         if "22" in open_ports:
-            info(f"  Testing {ip}:22 with fake credentials...")
+            info(f"  Probing {ip}:22 with fake credentials...")
             is_trap = _detect_cowrie(ip, port=22)
             cowrie_flags[ip] = is_trap
             if is_trap:
-                warn(f"  [TRAP] {ip} accepted garbage creds — Cowrie honeypot confirmed!")
+                warn(f"  ⚠  {ip} accepted garbage creds — Cowrie honeypot!")
             else:
                 ok(f"  {ip} rejected fake creds — real SSH server")
 
-    # ── Step 5: display results (honeypots flagged, not hidden) ───────────────
-    host_table = Table(
-        title="[bold magenta]Discovered Live Hosts[/bold magenta]",
-        show_header=True, header_style="bold cyan", border_style="dim",
-    )
-    host_table.add_column("#",          style="dim",    width=4)
-    host_table.add_column("IP Address", style="green",  width=18)
-    host_table.add_column("Open Ports", style="yellow", width=52)
+    trap_ips = {ip for ip, v in cowrie_flags.items() if v}
+
+    # ── Helper: render the host selection table ───────────────────────────────
+    def _render_host_table():
+        host_table = Table(
+            title="[bold magenta]Discovered Live Hosts[/bold magenta]",
+            show_header=True, header_style="bold cyan",
+            border_style="dim", show_lines=True,
+        )
+        host_table.add_column("#",            style="dim",    width=4)
+        host_table.add_column("IP Address",   style="green",  width=18)
+        host_table.add_column("Open Ports",   style="yellow", width=32)
+        host_table.add_column("Fingerprint",  width=28)
+
+        for i, (ip, open_ports) in enumerate(host_list, 1):
+            ports_str = ", ".join(open_ports)
+            if ip in trap_ips:
+                fp_str = "[bold yellow]🍯 HONEYPOT (Cowrie)[/bold yellow]"
+                host_table.add_row(
+                    f"[yellow]{i}[/yellow]",
+                    f"[bold yellow]{ip}[/bold yellow]",
+                    f"[yellow]{ports_str}[/yellow]",
+                    fp_str,
+                )
+            elif "22" in open_ports:
+                fp_str = "[bold green]✔ Real SSH[/bold green]"
+                host_table.add_row(str(i), ip, ports_str, fp_str)
+            else:
+                fp_str = "[dim]— (no SSH)[/dim]"
+                host_table.add_row(str(i), ip, ports_str, fp_str)
+
+        console.print(host_table)
+
+        # Honeypot warning panels
+        for ip in trap_ips:
+            console.print(Panel(
+                f"[bold yellow]⚠  Honeypot detected at [bold]{ip}[/bold][/bold yellow]\n"
+                "[dim]Do NOT select it. Cowrie will log all keystrokes and alert the blue team.[/dim]",
+                border_style="yellow", expand=False,
+            ))
+
+        console.print(
+            "[dim]  Select the Historian (✔ Real SSH preferred).  "
+            "[bold]q[/bold] = abort phase[/dim]"
+        )
+        console.print()
 
     host_list = list(live_hosts.items())
-    for i, (ip, open_ports) in enumerate(host_list, 1):
-        ports_str = ", ".join(open_ports)
-        if cowrie_flags.get(ip):
-            ports_str += "  [bold red]\[TRAP: Cowrie Honeypot][/bold red]"
-        host_table.add_row(str(i), ip, ports_str)
 
-    console.print(host_table)
-    console.print(
-        "[dim]  Honeypots are visible but flagged — "
-        "select the real Historian (port 22, not a trap).  "
-        "[bold]q[/bold] = abort[/dim]"
-    )
-    console.print()
+    # ── Step 6: operator selection loop (loops until confirmed) ───────────────
+    chosen_ip    = None
+    chosen_ports = None
 
-    raw = Prompt.ask(f"[yellow]Select Historian IP # (1–{len(host_list)})[/yellow]").strip().lower()
-    if raw == "q":
-        r.status  = "skipped"
-        r.finding = "Skipped by operator"
-        return r
-    try:
-        chosen_ip, chosen_ports = host_list[int(raw) - 1]
-    except (ValueError, IndexError):
-        r.status  = "failed"
-        r.finding = "Invalid selection"
-        err(r.finding)
-        return r
+    while True:
+        _render_host_table()
 
-    if cowrie_flags.get(chosen_ip):
-        warn(f"WARNING: {chosen_ip} is a confirmed Cowrie honeypot — selection noted")
+        raw = Prompt.ask(
+            f"[yellow]Select Historian IP # (1–{len(host_list)})[/yellow]"
+        ).strip().lower()
 
+        if raw == "q":
+            r.status  = "skipped"
+            r.finding = "Skipped by operator"
+            return r
+
+        try:
+            idx = int(raw) - 1
+            if not (0 <= idx < len(host_list)):
+                raise ValueError
+            sel_ip, sel_ports = host_list[idx]
+        except (ValueError, IndexError):
+            err("Invalid selection — enter a number from the table or 'q' to abort")
+            continue
+
+        # Honeypot double-confirm
+        if sel_ip in trap_ips:
+            console.print(Panel(
+                f"[bold red]⚠  You selected [bold]{sel_ip}[/bold] — a confirmed Cowrie honeypot.[/bold red]\n"
+                "[dim]This will trigger blue team alerts and log all your keystrokes.[/dim]",
+                title="[bold red] Honeypot Selected [/bold red]",
+                border_style="red", expand=False,
+            ))
+            if not Confirm.ask(
+                "[bold red]Proceed with known honeypot?[/bold red]", default=False
+            ):
+                warn("Re-showing table — please pick a real host")
+                continue
+
+        # Selection confirmation panel
+        fp_label = "🍯 HONEYPOT (Cowrie)" if sel_ip in trap_ips else (
+            "✔ Real SSH" if "22" in sel_ports else "— (no SSH)"
+        )
+        console.print(Panel(
+            f"[bold white]IP           :[/bold white]  {sel_ip}\n"
+            f"[bold white]Open ports   :[/bold white]  {', '.join(sel_ports)}\n"
+            f"[bold white]Fingerprint  :[/bold white]  {fp_label}",
+            title="[bold cyan] Confirm Historian Selection [/bold cyan]",
+            border_style="cyan", expand=False,
+        ))
+        if not Confirm.ask("[cyan]Proceed with this host?[/cyan]", default=True):
+            warn("Re-showing table — select again")
+            continue
+
+        # ── SSH banner grab for visual verification ───────────────────────────
+        if "22" in sel_ports:
+            info(f"Grabbing SSH banner from {sel_ip}:22...")
+            banner = _ssh_banner_grab(sel_ip)
+            if banner:
+                console.print(Panel(
+                    f"[bold white]Banner:[/bold white]  [dim]{escape(banner)}[/dim]",
+                    title=f"[bold green] SSH Banner — {sel_ip} [/bold green]",
+                    border_style="green", expand=False,
+                ))
+                ok("Banner retrieved — verify this looks like your Historian before continuing")
+            else:
+                warn("Could not retrieve SSH banner — host may be rate-limiting connections")
+
+        chosen_ip    = sel_ip
+        chosen_ports = sel_ports
+        break
+
+    # ── Step 7: commit and report ──────────────────────────────────────────────
     CFG["historian"]["ip"] = chosen_ip
-    ok(f"Historian set to [bold]{chosen_ip}[/bold]  (open ports: {', '.join(chosen_ports)})")
+    ok(f"Historian locked: [bold]{chosen_ip}[/bold]  ports: {', '.join(chosen_ports)}")
 
-    trap_count = sum(1 for v in cowrie_flags.values() if v)
+    trap_count = len(trap_ips)
     r.status  = "success"
     r.finding = (
         f"Historian: {chosen_ip}  |  "
-        f"{len(live_hosts)} hosts found across {len(discovered_subnets)} subnets  |  "
+        f"{len(live_hosts)} host(s) across {len(discovered_subnets)} subnet(s)  |  "
         f"{trap_count} honeypot(s) flagged"
     )
     r.output  = all_nmap_out[-2000:]
