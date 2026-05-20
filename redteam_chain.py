@@ -87,13 +87,18 @@ CFG = {
         "wordlist": "/usr/share/wordlists/rockyou.txt",
         "threads":  4,
     },
+    "network": {
+        # Prefix hint — discovered subnets matching this are sorted to position 0
+        # (they are the IDMZ, one firewall hop from the Wi-Fi network).
+        "idmz_hint": "10.10",
+    },
 }
 
 # ── Result tracking ───────────────────────────────────────────────────────────
 @dataclass
 class PhaseResult:
     phase:   str
-    status:  str = "pending"   # pending | success | failed | skipped
+    status:  str = "pending"   # pending | success | partial | failed | skipped
     output:  str = ""
     finding: str = ""
     ts:      str = field(default_factory=lambda: datetime.now().isoformat())
@@ -629,11 +634,79 @@ def _confirm_route_to(subnet: str, wifi_iface: str) -> bool:
     return False
 
 
+def _prioritise_subnets(subnets: list[str], local_subnet: str | None) -> list[str]:
+    """
+    Sort discovered subnets so the most reachable candidates are tried first.
+
+    Priority order:
+      0  CFG idmz_hint match (e.g. '10.10') — explicit operator hint
+      1  10.10.x.0/24  — IDMZ tier (one firewall hop)
+      2  10.x.x.0/24 with second octet < 20 — near OT
+      3  Everything else (deep OT zones, 172.16.x, etc.)
+
+    The local subnet itself is never included.
+    """
+    idmz_hint = CFG.get("network", {}).get("idmz_hint", "10.10")
+    local_24  = _ip_to_slash24(local_subnet.split("/")[0]) if local_subnet else None
+
+    def _rank(sn: str) -> int:
+        base = sn.split("/")[0]           # e.g. "10.10.10.0"
+        if sn == local_24:
+            return 99                      # never first
+        if base.startswith(idmz_hint + "."):
+            return 0                       # explicit IDMZ hint
+        parts = base.split(".")
+        if parts[0] == "10":
+            try:
+                second = int(parts[1])
+                if second == 10:
+                    return 1               # 10.10.x — IDMZ
+                if second < 20:
+                    return 2               # near OT
+                return 3                   # deeper OT / 10.20+
+            except (ValueError, IndexError):
+                return 3
+        return 4                           # 172.16.x, 192.168.x etc.
+
+    result = [sn for sn in subnets if _ip_to_slash24(sn.split("/")[0]) != local_24]
+    result.sort(key=_rank)
+    return result
+
+
+def _classify_unreachable(subnet: str, local_subnet: str | None) -> str:
+    """
+    Heuristic label explaining *why* a subnet could not be routed.
+    Used in the post-routing summary so the demo audience understands intent.
+    """
+    base   = subnet.split("/")[0]
+    parts  = base.split(".")
+
+    # Check if it's the same /24 as the PLC or IDS — those are OT assets
+    plc_24 = _ip_to_slash24(CFG["plc"]["ip"])
+    ids_24 = _ip_to_slash24(CFG["ids"]["ip"])
+    s24    = _ip_to_slash24(base)
+
+    if s24 in (plc_24, ids_24):
+        return "OT zone (PLC/IDS network) — reachable later via Phase 4 SSH pivot"
+
+    if parts[0] == "10":
+        try:
+            second = int(parts[1])
+            if second >= 20:
+                return "likely OT zone — not directly reachable from Wi-Fi"
+        except (ValueError, IndexError):
+            pass
+
+    return "routing failure — check gateway candidates"
+
+
 def auto_route(subnets: list[str]) -> dict[str, str | None]:
     """
-    Gateway Hunter — parallel-probes all candidates simultaneously.
-    Each thread runs a 4-step confirmation: ping → nmap SYN → raw socket.
+    Gateway Hunter — probes all subnets in priority order, never blocking
+    on a single failure.  Defers unreachable subnets and moves on immediately.
     Returns {subnet: winning_gateway_or_None} for every subnet attempted.
+    Only prompts the operator after ALL subnets have been tried, and only
+    when every subnet failed (single host with port 22 found → auto-continue).
     """
     wifi_iface          = CFG["wifi"]["interface"]
     default_gw          = _find_gateway()
@@ -645,17 +718,17 @@ def auto_route(subnets: list[str]) -> dict[str, str | None]:
 
     route_summary: dict[str, str | None] = {}   # subnet → winner gw or None
 
+    # ── Phase 1: try every subnet, defer failures immediately ────────────────
     for subnet in subnets:
-        info(f"Routing {subnet} — probing {len(candidates)} gateways in parallel...")
+        info(f"Routing {subnet} — probing {len(candidates)} gateways...")
 
-        winner_gw: list[str]         = []
-        won                          = threading.Event()
+        winner_gw: list[str]           = []
+        won                            = threading.Event()
         probe_results: dict[str, bool] = {}
-        lock                         = threading.Lock()
+        lock                           = threading.Lock()
 
         def _probe(gw: str, sn: str = subnet):
             _inject_route_silent(sn, gw, wifi_iface)
-            # 4-step confirmation: ping → nmap SYN-ping → raw socket
             alive = _confirm_route_to(sn, wifi_iface)
             with lock:
                 probe_results[gw] = alive
@@ -675,17 +748,7 @@ def auto_route(subnets: list[str]) -> dict[str, str | None]:
                 "(ping → nmap SYN → socket)...", total=None,
             )
             for t in threads:
-                t.join(timeout=35)   # enough for all 3 probe steps
-
-        # Per-gateway compact result table
-        gw_tbl = Table(show_header=True, header_style="bold cyan",
-                       border_style="dim", padding=(0, 1))
-        gw_tbl.add_column("Gateway", style="yellow", width=18)
-        gw_tbl.add_column("Result",  width=22)
-        for gw in candidates:
-            hit = probe_results.get(gw, False)
-            gw_tbl.add_row(gw, "[green]✔ Reachable[/green]" if hit else "[dim]✘ No response[/dim]")
-        console.print(gw_tbl)
+                t.join(timeout=35)
 
         # Clean up losing routes
         for gw in candidates:
@@ -696,75 +759,120 @@ def auto_route(subnets: list[str]) -> dict[str, str | None]:
         if winner_gw:
             ok(f"Route confirmed: {subnet} via [bold]{winner_gw[0]}[/bold] dev {wifi_iface}")
             route_summary[subnet] = winner_gw[0]
-            continue
+        else:
+            # Defer — do NOT block, move on to the next subnet
+            label = _classify_unreachable(subnet, local_subnet)
+            warn(f"⚠  {subnet} — unreachable, deferring  ({label})")
+            route_summary[subnet] = None
 
-        route_summary[subnet] = None
+    # ── Phase 2: combined routing summary ─────────────────────────────────────
+    routed  = {sn: gw for sn, gw in route_summary.items() if gw}
+    deferred = {sn for sn, gw in route_summary.items() if not gw}
 
-        # ── All candidates failed — operator menu ─────────────────────────────
-        while True:
-            console.print(Panel(
-                f"[bold red]✘  Route Discovery Failed — {subnet}[/bold red]\n\n"
-                "No live hosts found on any candidate gateway.\n"
-                "[dim]Verify: wlan0 is associated  |  FortiGate allows ICMP/TCP  |  lab is powered on[/dim]\n\n"
-                "  [bold]r[/bold]  →  Retry parallel probe\n"
-                "  [bold]m[/bold]  →  Manually enter gateway IP\n"
-                "  [bold]q[/bold]  →  Skip this subnet and continue",
-                title="[bold red] Route Discovery Failed [/bold red]",
-                border_style="red", expand=False,
-            ))
-            choice = Prompt.ask("[red]Action[/red]", choices=["r", "m", "q"], default="r")
-
-            if choice == "q":
-                warn(f"Skipping {subnet}")
-                break
-
-            if choice == "r":
-                winner_gw.clear()
-                won.clear()
-                probe_results.clear()
-                threads2 = [threading.Thread(target=_probe, args=(gw,), daemon=True)
-                            for gw in candidates]
-                for t in threads2: t.start()
-                with Progress(SpinnerColumn(), TextColumn("[cyan]{task.description}"),
-                              TimeElapsedColumn(), console=console, transient=True) as prog:
-                    prog.add_task(f"Retrying {len(candidates)} candidate(s)...", total=None)
-                    for t in threads2: t.join(timeout=35)
-                if winner_gw:
-                    ok(f"Route confirmed on retry: {subnet} via {winner_gw[0]}")
-                    route_summary[subnet] = winner_gw[0]
-                    break
-                continue
-
-            if choice == "m":
-                manual_gw = Prompt.ask("[yellow]Enter gateway IP[/yellow]").strip()
-                try:
-                    socket.inet_aton(manual_gw)
-                except OSError:
-                    err("Invalid IP — try again")
-                    continue
-                _inject_route_silent(subnet, manual_gw, wifi_iface)
-                if _confirm_route_to(subnet, wifi_iface):
-                    ok(f"Route confirmed: {subnet} via [bold]{manual_gw}[/bold]")
-                    route_summary[subnet] = manual_gw
-                    break
-                else:
-                    err(f"No response via {manual_gw} — try a different gateway")
-                    run_cmd(f"sudo ip route del {subnet} 2>/dev/null || true",
-                            silent=True, capture=False)
-
-    # ── Final route summary table ─────────────────────────────────────────────
     rt = Table(show_header=True, header_style="bold cyan",
                border_style="dim", show_lines=False, padding=(0, 1))
     rt.add_column("Subnet",  style="yellow", width=20)
     rt.add_column("Gateway", style="white",  width=18)
-    rt.add_column("Status",  width=12)
+    rt.add_column("Status",  width=46)
     for sn, gw in route_summary.items():
         if gw:
             rt.add_row(sn, gw, "[green]✔ Routed[/green]")
         else:
-            rt.add_row(sn, "—", "[red]✘ Failed[/red]")
-    console.print(Panel(rt, title="[bold cyan] Route Summary [/bold cyan]",
-                        border_style="cyan", expand=False))
+            label = _classify_unreachable(sn, local_subnet)
+            rt.add_row(sn, "—", f"[yellow]⚠ {label}[/yellow]")
+
+    summary_body = rt
+    summary_footer = ""
+    if deferred:
+        summary_footer = (
+            "\n[dim]Unreachable subnets are likely deeper OT zones "
+            "not accessible from the Wi-Fi network.[/dim]"
+        )
+
+    console.print(Panel(
+        summary_body,
+        title="[bold cyan] Routing Summary [/bold cyan]",
+        border_style="cyan", expand=False,
+    ))
+    if summary_footer:
+        console.print(summary_footer)
+
+    # ── Phase 3: operator prompt only when needed ─────────────────────────────
+    # Auto-continue if at least one subnet routed — the IDMZ is up, move forward.
+    # Only ask r/m/q when EVERY subnet failed (nothing reachable at all).
+    if routed:
+        if deferred:
+            info(f"Continuing with {len(routed)} routed subnet(s). "
+                 f"{len(deferred)} OT zone(s) will be reached via Phase 4 pivot.")
+        return route_summary
+
+    # All subnets failed — operator needs to intervene
+    console.print(Panel(
+        "[bold red]✘  No subnets could be routed.[/bold red]\n\n"
+        "All gateway probes failed.\n"
+        "[dim]Verify: wlan0 is associated  |  FortiGate allows ICMP/TCP  |  lab is powered on[/dim]\n\n"
+        "  [bold]r[/bold]  →  Retry all probes\n"
+        "  [bold]m[/bold]  →  Manually enter gateway IP for first subnet\n"
+        "  [bold]q[/bold]  →  Abort routing (phase will fail)",
+        title="[bold red] Route Discovery Failed [/bold red]",
+        border_style="red", expand=False,
+    ))
+    choice = Prompt.ask("[red]Action[/red]", choices=["r", "m", "q"], default="r")
+
+    if choice == "q":
+        warn("Operator aborted routing")
+        return route_summary
+
+    if choice == "r":
+        # Re-run for every still-failed subnet
+        retry_list = list(deferred)
+        for subnet in retry_list:
+            winner_gw2: list[str]           = []
+            won2                            = threading.Event()
+            probe_results2: dict[str, bool] = {}
+            lock2                           = threading.Lock()
+
+            def _probe2(gw: str, sn: str = subnet):
+                _inject_route_silent(sn, gw, wifi_iface)
+                alive = _confirm_route_to(sn, wifi_iface)
+                with lock2:
+                    probe_results2[gw] = alive
+                if alive and not won2.is_set():
+                    won2.set()
+                    winner_gw2.append(gw)
+
+            t2s = [threading.Thread(target=_probe2, args=(gw,), daemon=True) for gw in candidates]
+            for t in t2s: t.start()
+            with Progress(SpinnerColumn(), TextColumn("[cyan]{task.description}"),
+                          TimeElapsedColumn(), console=console, transient=True) as prog:
+                prog.add_task(f"Retrying {subnet}...", total=None)
+                for t in t2s: t.join(timeout=35)
+            for gw in candidates:
+                if not winner_gw2 or gw != winner_gw2[0]:
+                    run_cmd(f"sudo ip route del {subnet} 2>/dev/null || true",
+                            silent=True, capture=False)
+            if winner_gw2:
+                ok(f"Route confirmed on retry: {subnet} via {winner_gw2[0]}")
+                route_summary[subnet] = winner_gw2[0]
+
+    if choice == "m":
+        # Manual gateway for the first unrouted subnet only
+        first_failed = next(iter(deferred))
+        manual_gw = Prompt.ask(
+            f"[yellow]Enter gateway IP for {first_failed}[/yellow]"
+        ).strip()
+        try:
+            socket.inet_aton(manual_gw)
+            _inject_route_silent(first_failed, manual_gw, wifi_iface)
+            if _confirm_route_to(first_failed, wifi_iface):
+                ok(f"Route confirmed: {first_failed} via [bold]{manual_gw}[/bold]")
+                route_summary[first_failed] = manual_gw
+            else:
+                err(f"No response via {manual_gw}")
+                run_cmd(f"sudo ip route del {first_failed} 2>/dev/null || true",
+                        silent=True, capture=False)
+        except OSError:
+            err("Invalid IP — skipping manual entry")
 
     return route_summary
 
@@ -1108,17 +1216,29 @@ def phase2_idmz_recon() -> PhaseResult:
         r.finding = "No foreign subnets discovered — verify routing table and association"
         err(r.finding)
         return r
-    ok(f"Discovered subnets: {', '.join(discovered_subnets)}")
 
-    # ── Step 3: inject routes ─────────────────────────────────────────────────
+    # Sort by proximity: IDMZ hint first, deep OT last
+    ordered_subnets = _prioritise_subnets(discovered_subnets, local_subnet)
+    ok(f"Discovered subnets (priority order): {', '.join(ordered_subnets)}")
+
+    # ── Step 3: inject routes — non-blocking, defers unreachable subnets ─────
     info("Injecting routes for discovered subnets...")
-    auto_route(discovered_subnets)
+    route_results = auto_route(ordered_subnets)
 
-    # ── Step 4: fast ping sweep, then full port scan only on responsive subnets
+    routed_subnets  = [sn for sn, gw in route_results.items() if gw]
+    deferred_subnets = [sn for sn, gw in route_results.items() if not gw]
+
+    if not routed_subnets:
+        r.status  = "failed"
+        r.finding = "No subnets could be routed — all gateway probes failed"
+        err(r.finding)
+        return r
+
+    # ── Step 4: fast ping sweep + port scan — only on successfully routed subnets
     all_nmap_out = ""
     live_hosts: dict[str, list[str]] = {}
 
-    for subnet in discovered_subnets:
+    for subnet in routed_subnets:
         info(f"Ping sweep: {subnet}...")
         if not _ping_sweep_silent(subnet, timeout=10):
             warn(f"  No live hosts in {subnet} — skipping full port scan")
@@ -1132,7 +1252,7 @@ def phase2_idmz_recon() -> PhaseResult:
 
     if not live_hosts:
         r.status  = "failed"
-        r.finding = "No hosts with open ports found across discovered subnets"
+        r.finding = "No hosts with open ports found across routed subnets"
         err(r.finding)
         r.output  = all_nmap_out[-2000:]
         return r
@@ -1271,8 +1391,12 @@ def phase2_idmz_recon() -> PhaseResult:
         ).strip().lower()
 
         if raw == "q":
-            r.status  = "skipped"
-            r.finding = "Skipped by operator"
+            r.status  = "partial"
+            r.finding = (
+                f"{len(live_hosts)} host(s) found across {len(routed_subnets)} subnet(s) — "
+                "historian selection aborted by operator"
+            )
+            r.output  = all_nmap_out[-2000:]
             return r
 
         try:
@@ -1327,13 +1451,37 @@ def phase2_idmz_recon() -> PhaseResult:
         break
 
     # ── Step 7: commit ─────────────────────────────────────────────────────────
+    if chosen_ip is None:
+        # Operator typed 'q' — got here via the skipped path above, but guard anyway
+        r.status  = "partial"
+        r.finding = (
+            f"{len(live_hosts)} host(s) found across {len(routed_subnets)} subnet(s) — "
+            "historian not selected"
+        )
+        r.output  = all_nmap_out[-2000:]
+        return r
+
     CFG["historian"]["ip"] = chosen_ip
     ok(f"Historian locked: [bold]{chosen_ip}[/bold]  ports: {', '.join(chosen_ports)}")
 
+    # Build a contextual finding string for the demo audience
+    deferred_note = ""
+    if deferred_subnets:
+        plc_24 = _ip_to_slash24(CFG["plc"]["ip"])
+        ids_24 = _ip_to_slash24(CFG["ids"]["ip"])
+        ot_deferred = any(
+            _ip_to_slash24(sn.split("/")[0]) in (plc_24, ids_24)
+            for sn in deferred_subnets
+        )
+        if ot_deferred:
+            deferred_note = "  |  OT zone deferred to Phase 4 SSH pivot"
+        else:
+            deferred_note = f"  |  {len(deferred_subnets)} subnet(s) unreachable (not IDMZ)"
+
     r.status  = "success"
     r.finding = (
-        f"Historian: {chosen_ip}  |  "
-        f"{len(live_hosts)} host(s) across {len(discovered_subnets)} subnet(s)  |  "
+        f"Historian: {chosen_ip}  |  IDMZ routed"
+        f"{deferred_note}  |  "
         f"{len(trap_ips)} honeypot(s) flagged"
     )
     r.output  = all_nmap_out[-2000:]
@@ -2871,8 +3019,8 @@ def _phase_plan_panel():
 
 def _phase_status_card(n: int, title: str, status: str, finding: str, elapsed: float):
     """Print a compact result card after each phase completes."""
-    COLOR = {"success": "green", "failed": "red", "skipped": "yellow"}
-    ICON  = {"success": "✔", "failed": "✘", "skipped": "⊘"}
+    COLOR = {"success": "green", "partial": "cyan", "failed": "red", "skipped": "yellow"}
+    ICON  = {"success": "✔", "partial": "◑", "failed": "✘", "skipped": "⊘"}
     c = COLOR.get(status, "white")
     i = ICON.get(status, "●")
     console.print(Panel(
