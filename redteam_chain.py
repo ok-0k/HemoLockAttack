@@ -37,7 +37,10 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.rule import Rule
 from rich.prompt import Confirm, Prompt
-from rich.progress import Progress
+from rich.progress import (
+    Progress, SpinnerColumn, BarColumn,
+    TextColumn, TimeElapsedColumn, TaskProgressColumn,
+)
 from rich.live import Live
 from rich.markup import escape
 from rich.text import Text
@@ -98,6 +101,35 @@ class PhaseResult:
 
 results: list[PhaseResult] = []
 
+# ── Phase metadata (description, estimated runtime) ───────────────────────────
+PHASE_META: dict[int, tuple[str, str, str]] = {
+    # n : (name, one-line description, est. runtime)
+    1: ("WiFi AP Crack",
+        "Randomise MAC → monitor mode → besside-ng capture → aircrack-ng → nmcli connect",
+        "~3 min"),
+    2: ("IDMZ Recon",
+        "Gateway probe → subnet discovery → nmap sweep → Cowrie honeypot fingerprint",
+        "~2 min"),
+    3: ("SSH Brute Force",
+        "Sequential Paramiko brute-force of Historian SSH (port 22) with rockyou",
+        "~5 min"),
+    4: ("SSH Pivot / OT Recon",
+        "Steal SSH key from Historian → double-hop to IDS → fingerprint OT subnet",
+        "~1 min"),
+    5: ("CIP Recon — PLC Map",
+        "Build ssh -L CIP tunnel → enumerate every PLC tag → read live values",
+        "~1 min"),
+    6: ("PLC CIP Write Attack",
+        "Interactive tag-injection console with overclocked HMI stealth freeze thread",
+        "varies"),
+    7: ("Defense Validation",
+        "SSH Historian → IDS, tail Suricata logs for CIP alert confirmation",
+        "~30 s"),
+    8: ("Direct Remote I/O Inject",
+        "Bypass PLC ladder logic: write directly to Point I/O output assembly at 20 Hz",
+        "varies"),
+}
+
 # ── UI helpers ────────────────────────────────────────────────────────────────
 
 ASCII_BANNER = (
@@ -134,19 +166,19 @@ def phase_header(n: int, title: str):
 
 
 def ok(msg: str):
-    console.print(f"[bold green] [+][/bold green] [green]{msg}[/green]")
+    console.print(f"[bold green] ✔[/bold green] [green]{msg}[/green]")
 
 
 def warn(msg: str):
-    console.print(f"[bold yellow] [!][/bold yellow] [yellow]{msg}[/yellow]")
+    console.print(f"[bold yellow] ⚠[/bold yellow] [yellow]{msg}[/yellow]")
 
 
 def err(msg: str):
-    console.print(f"[bold red] [-][/bold red] [red]{msg}[/red]")
+    console.print(f"[bold red] ✘[/bold red] [red]{msg}[/red]")
 
 
 def info(msg: str):
-    console.print(f"[bold blue] [*][/bold blue] [blue]{msg}[/blue]")
+    console.print(f"[bold blue] ●[/bold blue] [blue]{msg}[/blue]")
 
 
 def run_cmd(cmd: str, timeout: int = 120, capture: bool = True) -> tuple[int, str]:
@@ -286,9 +318,19 @@ def ssh_hop(
     return inner
 
 
-def confirm_phase(title: str) -> bool:
-    console.print()  # blank line so prompt never lands mid-output
-    return Confirm.ask(f"[yellow]Run[/yellow] [bold]{title}[/bold]?", default=True)
+def confirm_phase(n: int, title: str) -> bool:
+    """Show a styled pre-flight card for the phase, then ask yes/no."""
+    _, desc, est = PHASE_META.get(n, (title, "No description available.", "unknown"))
+    console.print()
+    console.print(Panel(
+        f"[bold white]Phase     :[/bold white]  {n}  —  {title}\n"
+        f"[bold white]What      :[/bold white]  [dim]{desc}[/dim]\n"
+        f"[bold white]Est. time :[/bold white]  [cyan]{est}[/cyan]",
+        title="[bold yellow] ▶  Next Phase [/bold yellow]",
+        border_style="yellow", expand=False,
+    ))
+    console.print()
+    return Confirm.ask(f"[yellow]Execute Phase {n}[/yellow] [bold]{title}[/bold]?", default=True)
 
 
 def _resolve_wordlist(path: str) -> str | None:
@@ -1918,7 +1960,6 @@ def phase8_direct_io_inject() -> PhaseResult:
 
     from pycomm3 import LogixDriver, CommError
 
-    plc_ip  = CFG["plc"]["ip"]
     LOCAL_PORT = 44818
 
     # ── Known Point I/O output tag candidates (1734-OE2C / similar) ──────────
@@ -1938,8 +1979,16 @@ def phase8_direct_io_inject() -> PhaseResult:
     CIP_INSTANCES = [100, 101, 102, 104]
     CIP_ATTRIBUTE = 3
 
+    # ── Operator prompts — target IP and inject value ─────────────────────────
+    console.print()
+    adapter_ip = Prompt.ask(
+        "[yellow]Remote I/O Adapter IP[/yellow]  "
+        f"[dim](default: {CFG['plc']['ip']} — enter a different IP to target the I/O rack directly)[/dim]",
+        default=CFG["plc"]["ip"],
+    ).strip()
+
     console.print(Panel(
-        f"[bold white]Target     :[/bold white] [bold yellow]{plc_ip}[/bold yellow]  "
+        f"[bold white]Adapter    :[/bold white] [bold yellow]{adapter_ip}[/bold yellow]  "
         f"(via tunnel 127.0.0.1:{LOCAL_PORT})\n"
         f"[bold white]Module     :[/bold white] 1734-OE2C / Point I/O output rack\n"
         f"[bold white]Strategy   :[/bold white] Tag write → raw CIP Assembly Object fallback\n"
@@ -1978,11 +2027,11 @@ def phase8_direct_io_inject() -> PhaseResult:
         ids_pass  = CFG["ids"]["password"]
         ids_pkey  = CFG["ids"].get("private_key")
 
-        info(f"Opening ssh -L tunnel  127.0.0.1:{LOCAL_PORT} → {ids_ip} → {plc_ip}:{LOCAL_PORT}")
+        info(f"Opening ssh -L tunnel  127.0.0.1:{LOCAL_PORT} → {ids_ip} → {adapter_ip}:{LOCAL_PORT}")
         tunnel_proc, key_file = _open_cip_tunnel(
             hist_ip, hist_user, hist_pass,
             ids_ip,  ids_user,  ids_pass, ids_pkey,
-            plc_ip,  LOCAL_PORT,
+            adapter_ip, LOCAL_PORT,
         )
         info("Waiting 4 s for tunnel to stabilise...")
         time.sleep(4)
@@ -1991,7 +2040,7 @@ def phase8_direct_io_inject() -> PhaseResult:
             raise RuntimeError(
                 f"SSH tunnel exited immediately (rc={tunnel_proc.returncode})\n{stderr_out}"
             )
-        ok(f"Tunnel live  127.0.0.1:{LOCAL_PORT} → {plc_ip}")
+        ok(f"Tunnel live  127.0.0.1:{LOCAL_PORT} → {adapter_ip}")
 
         # ── Connect via slot hunt ─────────────────────────────────────────────
         CIP_SLOTS = ["", "/0", "/1", "/2", "/3"]
@@ -2139,43 +2188,174 @@ def phase8_direct_io_inject() -> PhaseResult:
 # ── Final report ──────────────────────────────────────────────────────────────
 
 def print_report():
-    console.print()
-    console.rule("[bold white]Attack Chain Report[/bold white]")
+    now_str   = datetime.now().strftime("%Y-%m-%d  %H:%M:%S")
+    ts_slug   = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    STATUS_STYLE = {
-        "success": ("green",  " SUCCESS"),
-        "failed":  ("red",    " FAILED "),
-        "skipped": ("yellow", " SKIPPED"),
-        "pending": ("dim",    " PENDING"),
+    STATUS_ICON = {
+        "success": ("green",  "✔  SUCCESS"),
+        "failed":  ("red",    "✘  FAILED "),
+        "skipped": ("yellow", "⊘  SKIPPED"),
+        "pending": ("dim",    "●  PENDING"),
     }
 
-    table = Table(show_header=True, header_style="bold magenta", border_style="dim")
-    table.add_column("#",       style="dim",   width=3)
-    table.add_column("Phase",   style="cyan",  width=26)
-    table.add_column("Status",  width=10)
-    table.add_column("Finding", width=54)
+    n_ok      = sum(1 for r in results if r.status == "success")
+    n_fail    = sum(1 for r in results if r.status == "failed")
+    n_skip    = sum(1 for r in results if r.status in ("skipped", "pending"))
+
+    console.print()
+    console.rule("[bold white]Attack Chain Report[/bold white]")
+    console.print()
+
+    # ── Header panel ──────────────────────────────────────────────────────────
+    console.print(Panel(
+        f"[bold white]Course     :[/bold white]  INCS 4810 — ICS/SCADA Security\n"
+        f"[bold white]Instructor :[/bold white]  Victor Mendez\n"
+        f"[bold white]Scope      :[/bold white]  Isolated BCIT Lab  (SW01-3550)  —  Authorized\n"
+        f"[bold white]Timestamp  :[/bold white]  {now_str}",
+        title="[bold cyan] Engagement Summary [/bold cyan]",
+        border_style="cyan", expand=False,
+    ))
+    console.print()
+
+    # ── Score bar ─────────────────────────────────────────────────────────────
+    score_line = (
+        f"[bold green]✔  {n_ok} succeeded[/bold green]   "
+        f"[bold red]✘  {n_fail} failed[/bold red]   "
+        f"[bold yellow]⊘  {n_skip} skipped[/bold yellow]"
+    )
+    console.print(Panel(score_line, border_style="dim", expand=False))
+    console.print()
+
+    # ── Phase detail table ────────────────────────────────────────────────────
+    table = Table(
+        show_header=True, header_style="bold magenta",
+        border_style="dim", show_lines=True,
+    )
+    table.add_column("#",         style="dim",    width=3,  justify="right")
+    table.add_column("Phase",     style="cyan",   width=28)
+    table.add_column("Status",    width=14)
+    table.add_column("Timestamp", style="dim",    width=22)
+    table.add_column("Finding",   width=48)
 
     for i, r in enumerate(results, 1):
-        color, label = STATUS_STYLE.get(r.status, ("white", r.status.upper()))
+        color, icon = STATUS_ICON.get(r.status, ("white", r.status.upper()))
+        ts_display  = r.ts[:19].replace("T", "  ") if r.ts else "—"
         table.add_row(
             str(i),
             r.phase,
-            f"[bold {color}]{label}[/bold {color}]",
-            r.finding,
+            f"[bold {color}]{icon}[/bold {color}]",
+            ts_display,
+            escape(r.finding),
         )
 
     console.print(table)
+    console.print()
 
-    report_path = f"/tmp/incs4810_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-    data = [
-        {"phase": r.phase, "status": r.status,
-         "finding": r.finding, "ts": r.ts, "output": r.output}
-        for r in results
-    ]
-    with open(report_path, "w") as f:
-        json.dump(data, f, indent=2)
+    # ── Key findings ──────────────────────────────────────────────────────────
+    notable = [r for r in results if r.status in ("success", "failed") and r.finding]
+    if notable:
+        console.rule("[bold white]Key Findings[/bold white]")
+        console.print()
+        for r in notable:
+            color, icon = STATUS_ICON.get(r.status, ("white", "●"))
+            console.print(
+                f"  [bold {color}]{icon}[/bold {color}]  "
+                f"[bold]{escape(r.phase)}[/bold]\n"
+                f"         [dim]{escape(r.finding)}[/dim]"
+            )
+        console.print()
 
-    ok(f"Full JSON report saved: {report_path}")
+    # ── Risk verdict ──────────────────────────────────────────────────────────
+    if n_fail == 0 and n_ok > 0:
+        verdict_color  = "red"
+        verdict_icon   = "🔴"
+        verdict_label  = "CRITICAL"
+        verdict_detail = "All phases completed successfully — full attack chain confirmed."
+    elif n_ok > 0:
+        verdict_color  = "yellow"
+        verdict_icon   = "🟡"
+        verdict_label  = "ELEVATED"
+        verdict_detail = f"{n_ok} phase(s) succeeded — partial chain execution confirmed."
+    else:
+        verdict_color  = "green"
+        verdict_icon   = "🟢"
+        verdict_label  = "CONTAINED"
+        verdict_detail = "No phases succeeded — defenses appear effective."
+
+    console.print(Panel(
+        f"[bold {verdict_color}]{verdict_icon}  {verdict_label}[/bold {verdict_color}]\n"
+        f"[dim]{verdict_detail}[/dim]",
+        title="[bold white] Risk Verdict [/bold white]",
+        border_style=verdict_color, expand=False,
+    ))
+    console.print()
+
+    # ── Save HTML report ──────────────────────────────────────────────────────
+    report_path = f"/tmp/incs4810_report_{ts_slug}.html"
+
+    rows_html = ""
+    for i, r in enumerate(results, 1):
+        _, icon = STATUS_ICON.get(r.status, ("white", r.status))
+        bg = {"success": "#1a3a1a", "failed": "#3a1a1a",
+              "skipped": "#2a2a10", "pending": "#1a1a1a"}.get(r.status, "#1a1a1a")
+        ts_display = r.ts[:19].replace("T", " ") if r.ts else "—"
+        rows_html += (
+            f"<tr style='background:{bg}'>"
+            f"<td>{i}</td><td>{r.phase}</td>"
+            f"<td>{icon.strip()}</td>"
+            f"<td style='font-size:0.85em;color:#aaa'>{ts_display}</td>"
+            f"<td>{escape(r.finding)}</td>"
+            f"</tr>\n"
+        )
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>INCS 4810 — Red Team Report  {ts_slug}</title>
+<style>
+  body  {{ font-family: 'Courier New', monospace; background:#0d0d0d; color:#e0e0e0; margin:2rem; }}
+  h1    {{ color:#ff4444; }}
+  table {{ border-collapse:collapse; width:100%; margin-top:1rem; }}
+  th    {{ background:#1e1e1e; color:#00cfff; padding:8px 12px; text-align:left; border-bottom:2px solid #333; }}
+  td    {{ padding:7px 12px; border-bottom:1px solid #222; vertical-align:top; }}
+  .meta {{ background:#111; border:1px solid #333; padding:1rem; border-radius:6px; margin-bottom:1rem; }}
+  .score {{ margin:1rem 0; font-size:1.1em; }}
+  .verdict {{ border:2px solid; border-radius:6px; padding:1rem; margin-top:1.5rem; }}
+  .CRITICAL {{ border-color:#ff4444; background:#1a0000; }}
+  .ELEVATED {{ border-color:#ffaa00; background:#1a1000; }}
+  .CONTAINED {{ border-color:#44ff44; background:#001a00; }}
+</style>
+</head>
+<body>
+<h1>INCS 4810 — ICS/SCADA Red Team Report</h1>
+<div class="meta">
+  <b>Course:</b> INCS 4810 — ICS/SCADA Security<br>
+  <b>Instructor:</b> Victor Mendez<br>
+  <b>Scope:</b> Isolated BCIT Lab (SW01-3550) — Authorized<br>
+  <b>Generated:</b> {now_str}
+</div>
+<div class="score">
+  <span style="color:#44ff44">✔ {n_ok} succeeded</span> &nbsp;&nbsp;
+  <span style="color:#ff4444">✘ {n_fail} failed</span> &nbsp;&nbsp;
+  <span style="color:#ffaa00">⊘ {n_skip} skipped</span>
+</div>
+<table>
+  <tr><th>#</th><th>Phase</th><th>Status</th><th>Timestamp</th><th>Finding</th></tr>
+  {rows_html}
+</table>
+<div class="verdict {verdict_label}">
+  <b>{verdict_icon} {verdict_label}</b><br>
+  <span style="color:#aaa">{verdict_detail}</span>
+</div>
+</body>
+</html>"""
+
+    with open(report_path, "w", encoding="utf-8") as f:
+        f.write(html)
+
+    ok(f"HTML report saved → [bold]{report_path}[/bold]  (open in browser for full view)")
 
 
 # ── Phase registry ────────────────────────────────────────────────────────────
@@ -2188,30 +2368,80 @@ PHASES = [
     (5, "CIP Recon — PLC Map",        phase5_cip_enum),
     (6, "PLC CIP Write Attack",       phase5_plc_attack),
     (7, "Defense Validation",         phase6_defense_check),
-    (8, "Direct Remote I/O Inject",   phase8_direct_io_inject),
 ]
+
+
+def _phase_plan_panel():
+    """Print the full phase plan before anything runs."""
+    tbl = Table(
+        show_header=True, header_style="bold cyan",
+        border_style="dim", show_lines=False, padding=(0, 1),
+    )
+    tbl.add_column("#",       style="dim",   width=3,  justify="right")
+    tbl.add_column("Phase",   style="green", width=28)
+    tbl.add_column("What",    style="white", width=56)
+    tbl.add_column("Est.",    style="cyan",  width=9)
+    for n, title, _ in PHASES:
+        _, desc, est = PHASE_META.get(n, (title, "—", "—"))
+        tbl.add_row(str(n), title, desc, est)
+    console.print(Panel(
+        tbl,
+        title="[bold cyan] Attack Chain — Phase Plan [/bold cyan]",
+        border_style="cyan", expand=False,
+    ))
+
+
+def _phase_status_card(n: int, title: str, status: str, finding: str, elapsed: float):
+    """Print a compact result card after each phase completes."""
+    COLOR = {"success": "green", "failed": "red", "skipped": "yellow"}
+    ICON  = {"success": "✔", "failed": "✘", "skipped": "⊘"}
+    c = COLOR.get(status, "white")
+    i = ICON.get(status, "●")
+    console.print(Panel(
+        f"[bold {c}]{i}  {status.upper()}[/bold {c}]   "
+        f"[dim]elapsed [bold]{elapsed:.1f}s[/bold][/dim]\n"
+        f"[dim]{escape(finding) if finding else '—'}[/dim]",
+        title=f"[bold {c}] Phase {n}: {title} [/bold {c}]",
+        border_style=c, expand=False,
+    ))
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main():
+    # Build --phases help text with names
+    phase_help = "Run specific phases only. Numbers and names:\n" + "\n".join(
+        f"  {n}  {title}" for n, title, _ in PHASES
+    )
+
     parser = argparse.ArgumentParser(
-        description="INCS 4810 Red Team Chain — BCIT Authorized Lab"
+        description="INCS 4810 Red Team Chain — BCIT Authorized Lab",
+        formatter_class=argparse.RawTextHelpFormatter,
     )
     parser.add_argument(
         "--phases", nargs="*", type=int,
-        help="Run specific phases only, e.g. --phases 2 3 4"
+        metavar="N",
+        help=phase_help,
     )
     parser.add_argument(
         "--auto", action="store_true",
-        help="Skip per-phase confirmation prompts"
+        help="Skip per-phase confirmation prompts",
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help="Walk through all phase prompts but skip actual execution",
+    )
+    parser.add_argument(
+        "--skip-failed", action="store_true",
+        help="Auto-continue past failed phases without prompting",
     )
     args = parser.parse_args()
 
     banner()
+    _phase_plan_panel()
     preflight_check()
 
-    selected   = set(args.phases) if args.phases else {n for n, _, _ in PHASES}
+    selected    = set(args.phases) if args.phases else {n for n, _, _ in PHASES}
     chain_start = time.monotonic()
 
     for n, title, fn in PHASES:
@@ -2219,8 +2449,14 @@ def main():
             results.append(PhaseResult(title, status="skipped", finding="Not selected"))
             continue
 
-        if not args.auto and not confirm_phase(f"Phase {n}/{len(PHASES)}: {title}"):
+        if not args.auto and not confirm_phase(n, title):
             results.append(PhaseResult(title, status="skipped", finding="Skipped by operator"))
+            continue
+
+        if args.dry_run:
+            r = PhaseResult(title, status="skipped", finding="Dry run — execution skipped")
+            results.append(r)
+            _phase_status_card(n, title, r.status, r.finding, 0.0)
             continue
 
         while True:
@@ -2228,41 +2464,50 @@ def main():
             r = fn()
             phase_elapsed = time.monotonic() - phase_start
 
-            status_color = "green" if r.status == "success" else "red" if r.status == "failed" else "yellow"
-            console.print(
-                f"\n[dim]Phase {n} complete — "
-                f"[{status_color}]{r.status.upper()}[/{status_color}]  "
-                f"elapsed [bold]{phase_elapsed:.1f}s[/bold][/dim]"
-            )
+            _phase_status_card(n, title, r.status, r.finding, phase_elapsed)
 
-            if r.status != "failed" or args.auto:
-                break   # success / skipped, or auto mode — move on
+            if r.status != "failed" or args.auto or args.skip_failed:
+                break
 
+            # ── Failure prompt — show options FIRST, then ask ─────────────────
             console.print()
+            console.print(Panel(
+                "  [bold]r[/bold]  →  Retry this phase\n"
+                "  [bold]c[/bold]  →  Continue to next phase\n"
+                "  [bold]q[/bold]  →  Quit and generate report",
+                title="[bold red] ✘  Phase Failed — Choose Action [/bold red]",
+                border_style="red", expand=False,
+            ))
             choice = Prompt.ask(
-                "[red]Phase failed[/red] — what next?",
+                "[red]Action[/red]",
                 choices=["r", "c", "q"],
                 default="c",
             )
-            console.print("[dim]  r = retry  |  c = continue to next phase  |  q = quit[/dim]")
 
             if choice == "r":
                 warn(f"Retrying Phase {n}: {title} ...")
-                continue        # re-run fn()
+                continue
             elif choice == "q":
                 results.append(r)
                 console.print("[bold red]Aborted by operator.[/bold red]")
-                chain_elapsed = time.monotonic() - chain_start
-                console.print(f"\n[dim]Total chain elapsed: [bold]{chain_elapsed:.1f}s[/bold][/dim]")
-                print_report()
-                return
+                break
             else:
-                break           # continue to next phase
+                break
 
         results.append(r)
 
     chain_elapsed = time.monotonic() - chain_start
-    console.print(f"\n[dim]Total chain elapsed: [bold]{chain_elapsed:.1f}s[/bold][/dim]")
+    console.print()
+    console.print(Panel(
+        f"[bold white]Total elapsed :[/bold white]  [bold cyan]{chain_elapsed:.1f}s[/bold cyan]   "
+        f"({chain_elapsed/60:.1f} min)\n"
+        f"[bold white]Phases run    :[/bold white]  "
+        f"[green]{sum(1 for r in results if r.status == 'success')} ok[/green]  "
+        f"[red]{sum(1 for r in results if r.status == 'failed')} failed[/red]  "
+        f"[yellow]{sum(1 for r in results if r.status in ('skipped','pending'))} skipped[/yellow]",
+        title="[bold cyan] Chain Complete [/bold cyan]",
+        border_style="cyan", expand=False,
+    ))
     print_report()
 
 
