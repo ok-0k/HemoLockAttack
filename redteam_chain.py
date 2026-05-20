@@ -405,95 +405,49 @@ def _is_lab_subnet(subnet: str) -> bool:
 
 def _assert_lab_target(cmd: str):
     """
-    Hard safety net: raise RuntimeError if an nmap command targets a public IP.
-    Called before every nmap invocation so accidental public scanning is impossible.
+    Hard safety net: raise RuntimeError if cmd targets a public IP.
+    Called immediately before any run_cmd/stream_cmd that contains 'nmap'.
     """
     import ipaddress
     for token in cmd.split():
-        # strip trailing slashes / masks that aren't valid CIDR on their own
-        token = token.split(" ")[0]
         try:
             net = ipaddress.ip_network(token, strict=False)
             if not net.is_private:
                 raise RuntimeError(
-                    f"SAFETY BLOCK: nmap target '{token}' is a public IP — aborting"
+                    f"SAFETY BLOCK: refusing to scan public IP {token}"
                 )
         except ValueError:
-            pass   # not an IP token
+            pass
 
 
-def _probe_gateway_for_subnets(gateway: str) -> list[str]:
+def _get_target_subnets(local_subnet: str | None) -> list[str]:
     """
-    Discover target /24 subnets scoped strictly to the lab.
-    Does NOT use traceroute — traceroute follows packets to the internet
-    and turns every public hop into a false-positive scan target.
-
-    Source 1 — Routing table : non-default routes already installed (instant).
-    Source 2 — CFG inference : /24 of historian / IDS / PLC IPs (zero packets).
-    Source 3 — Targeted sweep: 10.10.x / 10.20.x nmap sweep (last resort, 60 s cap).
-
-    Every candidate is run through _is_lab_subnet() before being accepted.
+    Derive the exact set of /24 subnets to scan from the IPs already in CFG.
+    Zero active probing — no traceroute, no nmap sweeps, no routing-table guesswork.
+    Result for this lab: ["10.10.10.0/24", "10.20.20.0/24"] — always, with zero noise.
     """
-    _, local_subnet = _get_local_interface()
-    local_prefix = _ip_to_slash24(local_subnet.split("/")[0]) if local_subnet else None
+    import ipaddress
 
-    found: set[str] = set()
+    def _to_slash24(ip: str) -> str | None:
+        try:
+            net = ipaddress.ip_network(f"{ip}/24", strict=False)
+            return str(net) if net.is_private else None
+        except ValueError:
+            return None
 
-    def _add(ip_or_net: str):
-        """Accept only RFC-1918 subnets that are not the local wlan0 subnet."""
-        slash24 = _ip_to_slash24(ip_or_net.split("/")[0])
-        if slash24 and slash24 != local_prefix and _is_lab_subnet(slash24):
-            found.add(slash24)
+    cfg_ips = [CFG["historian"]["ip"], CFG["ids"]["ip"], CFG["plc"]["ip"]]
 
-    # ── Source 1: existing routing table entries (zero packets) ──────────────
-    _, route_out = run_cmd("ip route show", capture=False, silent=True)
-    for line in route_out.splitlines():
-        parts = line.split()
-        if not parts or parts[0] in ("default", "local", "broadcast"):
-            continue
-        net = parts[0]
-        if "/" in net:
-            _add(net)
+    seen: set[str] = set()
+    subnets: list[str] = []
+    for ip in cfg_ips:
+        subnet = _to_slash24(ip)
+        if subnet and subnet not in seen and subnet != local_subnet:
+            seen.add(subnet)
+            subnets.append(subnet)
 
-    # ── Source 2: CFG ground-truth targets (zero packets) ────────────────────
-    for ip in (CFG["historian"]["ip"], CFG["ids"]["ip"], CFG["plc"]["ip"]):
-        _add(ip)
-
-    if found:
-        return list(found)
-
-    # ── Source 3: targeted nmap sweep of known OT ranges only (last resort) ──
-    priority_chunks: list[str] = []
-    for third in range(1, 25):
-        priority_chunks.append(f"10.10.{third}.0/24")
-    for third in range(20, 30):
-        priority_chunks.append(f"10.20.{third}.0/24")
-    # Exclude local subnet and anything non-private (safety net)
-    priority_chunks = [
-        c for c in priority_chunks
-        if _ip_to_slash24(c.split("/")[0]) != local_prefix and _is_lab_subnet(c)
-    ]
-
-    batch_size = 8
-    deadline   = time.monotonic() + 60
-    for i in range(0, len(priority_chunks), batch_size):
-        if time.monotonic() > deadline:
-            break
-        batch = " ".join(priority_chunks[i:i + batch_size])
-        _assert_lab_target(batch)
-        _, out = run_cmd(
-            f"sudo nmap -T5 -n -sn -PS22,44818 --max-retries 0 {batch} 2>/dev/null"
-            " | grep 'Nmap scan report'",
-            timeout=20, capture=False, silent=True,
-        )
-        for line in out.splitlines():
-            parts = line.strip().split()
-            if parts:
-                _add(parts[-1])
-        if found:
-            break
-
-    return list(found)
+    # 10.10.x first (IDMZ — one hop), 10.20.x second (OT zone — deferred to Phase 4)
+    subnets.sort(key=lambda s: (s.split(".")[1] != "10", s))
+    return subnets
 
 
 def _get_local_interface() -> tuple[str, str] | tuple[None, None]:
@@ -1183,24 +1137,8 @@ def phase2_idmz_recon() -> PhaseResult:
     _, local_subnet = _get_local_interface()
     local_prefix    = _ip_to_slash24(local_subnet.split("/")[0]) if local_subnet else None
 
-    # ── Steps 1-2: gateway + subnet discovery (wrapped in a single spinner) ───
-    gateway            = None
-    discovered_subnets: list[str] = []
-
-    with Progress(SpinnerColumn(), TextColumn("[cyan]{task.description}"),
-                  TimeElapsedColumn(), console=console, transient=True) as prog:
-        task = prog.add_task(
-            "Discovering IDMZ subnets — routing table + CFG inference...",
-            total=None,
-        )
-
-        gateway = _find_gateway()
-        if not gateway:
-            pass   # handled below
-        else:
-            prog.update(task, description=f"Gateway: {gateway} — resolving target subnets...")
-            discovered_subnets = _probe_gateway_for_subnets(gateway)
-
+    # ── Steps 1-2: gateway check + CFG-based subnet derivation ─────────────────
+    gateway = _find_gateway()
     if not gateway:
         r.status  = "failed"
         r.finding = "No default gateway found — is wlan0 associated?"
@@ -1208,21 +1146,14 @@ def phase2_idmz_recon() -> PhaseResult:
         return r
     ok(f"Gateway: [bold]{gateway}[/bold]")
 
-    # Hard-filter: drop anything non-RFC-1918 and the local wlan0 subnet
-    discovered_subnets = [
-        sn for sn in discovered_subnets
-        if _is_lab_subnet(sn) and _ip_to_slash24(sn.split("/")[0]) != local_prefix
-    ]
-
-    if not discovered_subnets:
+    # Derive target subnets purely from CFG IPs — no traceroute, no active probing
+    ordered_subnets = _get_target_subnets(local_subnet)
+    if not ordered_subnets:
         r.status  = "failed"
-        r.finding = "No lab subnets discovered — verify routing table and CFG IPs"
+        r.finding = "No target subnets derived from CFG — verify historian/IDS/PLC IPs"
         err(r.finding)
         return r
-
-    # Sort by proximity: IDMZ hint first, deep OT last
-    ordered_subnets = _prioritise_subnets(discovered_subnets, local_subnet)
-    ok(f"Target subnets (priority order): {', '.join(ordered_subnets)}")
+    ok(f"Target subnets: {', '.join(ordered_subnets)}")
 
     # ── Step 3: inject routes — non-blocking, defers unreachable subnets ─────
     info("Injecting routes for discovered subnets...")
